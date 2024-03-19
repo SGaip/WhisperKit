@@ -17,7 +17,11 @@ struct ContentView: View {
     @State var currentText: String = ""
     // TODO: Make this configurable in the UI
     @State var modelStorage: String = "huggingface/models/argmaxinc/whisperkit-coreml"
-
+    @State var prompt: String = """
+    I'm having a job interview, above is the transcript of interview so far.
+    Please help me generate answers of questions.
+    """
+    @State private var apiResponseSummary: String = ""
     @State private var modelState: ModelState = .unloaded
     @State private var localModels: [String] = []
     @State private var localModelPath: String = ""
@@ -102,6 +106,13 @@ struct ContentView: View {
             modelSelectorView
                 .padding()
             Spacer()
+            
+            TextEditor(text: $prompt)
+            .frame(minHeight: 100)
+            .border(Color.gray, width: 1)
+            .padding()
+            Spacer()
+            
             List(menu, selection: $selectedCategoryId) { item in
                 HStack {
                     Image(systemName: item.image)
@@ -112,7 +123,7 @@ struct ContentView: View {
             }
             .disabled(modelState != .loaded)
             .foregroundColor(modelState != .loaded ? .secondary : .primary)
-            .navigationTitle("WhisperAX")
+            .navigationTitle("Chat Co-pilot")
             .navigationSplitViewColumnWidth(min: 300, ideal: 350)
         } detail: {
             VStack {
@@ -127,6 +138,12 @@ struct ContentView: View {
                 .padding()
                 #endif
                 controlsView
+                Button("Get Suggestion") {
+                    Task {
+                        await getSuggestion()
+                    }
+                }
+                .padding()
             }
             .toolbar(content: {
                 ToolbarItem {
@@ -200,6 +217,13 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                     Text("\(currentText)")
                         .font(.caption)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if !apiResponseSummary.isEmpty {
+                    Text(apiResponseSummary)
+                        .font(.headline)
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.leading)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -627,7 +651,126 @@ struct ContentView: View {
     }
 
     // MARK: Logic
-
+    
+    //Get suggestin logic
+    func getSuggestion() async {
+        let fullTranscript = formatSegments(confirmedSegments + unconfirmedSegments, withTimestamps:
+                                                enableTimestamps).joined(separator: "\n")
+        let message = """
+        \(fullTranscript)
+        ------
+        \(self.prompt)
+        """
+        print("prompt: \(message)")
+        
+        let requestData = [
+            "input": [
+                "top_k": 50,
+                "top_p": 0.9,
+                "prompt": message,
+                "temperature": 0.6,
+                "max_new_tokens": 1024,
+                "prompt_template": "<s>[INST] {prompt} [/INST]",
+                "presence_penalty": 0,
+                "frequency_penalty":0
+                ]
+        ]
+        
+        // Convert requestData to JSON
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: requestData) else {
+            print("Error: Cannot create JSON from requestData")
+            return
+        }
+        
+        // Create a URL request
+        guard let url = URL(string: "https://api.replicate.com/v1/models/mistralai/mixtral-8x7b-instruct-v0.1/predictions") else {
+            print("invalid URL")
+            return
+        }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        let apiToken = "b6b64f8ae672ececa322ed6579e564863cab674a"
+        request.setValue("Token \(apiToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = jsonData
+        
+        //Send the request
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse, (httpResponse.statusCode == 200 || httpResponse.statusCode == 201) else {
+                print("Error: Invalid response from server")
+                print("Response: \(response)")
+                return
+            }
+            
+            //Decode the response
+            print("Response: \(String(data: data, encoding: .utf8) ?? "nil")")
+            guard let jsonResponse = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
+                let urls = jsonResponse["urls"] as? [String: String],
+                let getResultUrl = urls["get"] else {
+                print("Error: Invalid JSON response")
+                return
+            }
+            
+            // Check the result periodically
+            await checkApiResult(url: getResultUrl)
+        } catch {
+            print("Error: \(error.localizedDescription)")
+        }
+    }
+    
+    func checkApiResult(url: String) async {
+        guard let checkUrl = URL(string: url) else {
+            print("Invalid URL")
+            return
+        }
+        
+        var request = URLRequest(url: checkUrl)
+        request.httpMethod = "GET"
+        let apiToken = "b6b64f8ae672ececa322ed6579e564863cab674a"
+        request.setValue("Token \(apiToken)", forHTTPHeaderField: "Authorization")
+        
+        var isCompleted = false
+        while !isCompleted {
+            try? await Task.sleep(nanoseconds: 500_000_000) // Sleep for 5 seconds
+            
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+                    print("Error: Invalid response from server")
+                    print("Response: \(response)")
+                    return
+                }
+            
+                guard let jsonResponse = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any], 
+                    let status = jsonResponse["status"] as? String else {
+                    print("Error: Invalid JSON response")
+                    return
+                }
+                
+                if status == "succeeded" {
+                    isCompleted = true
+                } else if let output = jsonResponse["output"] as? [String] {
+                    // Join the output array into a singel string
+                    print("Output: \(output), status: \(status)")
+                    let summary = output.joined(separator: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    
+                    DispatchQueue.main.async {
+                        //Handel the summary text, eg., display it in the UI
+                        //Assuming 'currentText' is the State variable to display the summary
+                        //CurrentText = summary
+                        self.apiResponseSummary = summary
+                    }
+                }
+                                                                        
+            } catch {
+                    print("Error: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+    
     func fetchModels() {
         availableModels = [selectedModel]
 
