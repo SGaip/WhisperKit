@@ -9,19 +9,47 @@ import UIKit
 import AppKit
 #endif
 import AVFoundation
+import Foundation
+
+// Place your model definitions here
+struct ChatMessage: Codable {
+    let role: String
+    let content: String
+}
+
+struct GroqChatRequest: Codable {
+    let model: String
+    let messages: [ChatMessage]
+}
+
+struct Choice: Codable {
+    let index: Int
+    let message: ChatMessage
+    let finishReason: String?
+    let logprobs: [Double]?
+}
+
+struct GroqChatResponse: Codable {
+    let id: String
+    let object: String
+    let created: Int
+    let model: String
+    let choices: [Choice]
+    // Include other properties that the API might return
+}
 
 struct ContentView: View {
     @State var whisperKit: WhisperKit? = nil
-    #if os(macOS)
+#if os(macOS)
     @State var audioDevices: [AudioDevice]? = nil
-    #endif
+#endif
     @State var isRecording: Bool = false
     @State var isTranscribing: Bool = false
     @State var currentText: String = ""
     // TODO: Make this configurable in the UI
     @State var modelStorage: String = "huggingface/models/argmaxinc/whisperkit-coreml"
     @State var prompt: String = """
-    I'm having a job interview, above is the transcript of interview so far.
+    I'm having a job interview, below is the transcript of interview so far.
     Please help me generate answers of questions.
     """
     @State private var apiResponseSummary: String = ""
@@ -103,6 +131,8 @@ struct ContentView: View {
         bufferEnergy = []
         confirmedSegments = []
         unconfirmedSegments = []
+        // Also reset the API response summary
+        apiResponseSummary = ""
     }
 
     var body: some View {
@@ -719,125 +749,87 @@ struct ContentView: View {
     }
 
     // MARK: Logic
-    
-    //Get suggestin logic
+
     func getSuggestion() async {
-        let fullTranscript = formatSegments(confirmedSegments + unconfirmedSegments, withTimestamps:
-                                                enableTimestamps).joined(separator: "\n")
-        let message = """
-        \(fullTranscript)
-        ------
-        \(self.prompt)
-        """
-        print("prompt: \(message)")
+        let fullTranscript = formatSegments(confirmedSegments + unconfirmedSegments, withTimestamps: enableTimestamps).joined(separator: "\n")
+
+        // System instruction as a separate message
+        let systemMessage = ChatMessage(role: "system", content: self.prompt)
         
-        let requestData = [
-            "input": [
-                "top_k": 50,
-                "top_p": 0.9,
-                "prompt": message,
-                "temperature": 0.6,
-                "max_new_tokens": 1024,
-                "prompt_template": "<s>[INST] {prompt} [/INST]",
-                "presence_penalty": 0,
-                "frequency_penalty":0
-                ]
-        ]
-        
-        // Convert requestData to JSON
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: requestData) else {
-            print("Error: Cannot create JSON from requestData")
-            return
-        }
-        
-        // Create a URL request
-        guard let url = URL(string: "https://api.replicate.com/v1/models/mistralai/mixtral-8x7b-instruct-v0.1/predictions") else {
-            print("invalid URL")
-            return
-        }
-        
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        let apiToken = "b6b64f8ae672ececa322ed6579e564863cab674a"
-        request.setValue("Token \(apiToken)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = jsonData
-        
-        //Send the request
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let httpResponse = response as? HTTPURLResponse, (httpResponse.statusCode == 200 || httpResponse.statusCode == 201) else {
-                print("Error: Invalid response from server")
-                print("Response: \(response)")
-                return
-            }
-            
-            //Decode the response
-            print("Response: \(String(data: data, encoding: .utf8) ?? "nil")")
-            guard let jsonResponse = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
-                let urls = jsonResponse["urls"] as? [String: String],
-                let getResultUrl = urls["get"] else {
-                print("Error: Invalid JSON response")
-                return
-            }
-            
-            // Check the result periodically
-            await checkApiResult(url: getResultUrl)
-        } catch {
-            print("Error: \(error.localizedDescription)")
-        }
+        // User transcript as a separate message
+        let userMessage = ChatMessage(role: "user", content: fullTranscript)
+
+        // Constructing the messages array with system and user messages as separate entries
+        let messages = [systemMessage, userMessage]
+
+        // Constructing the request with required and optional parameters
+        let groqRequest = GroqChatRequest(
+            model: "mixtral-8x7b-32768",
+            messages: messages
+        )
+
+        await sendGroqRequest(groqRequest)
     }
+
     
-    func checkApiResult(url: String) async {
-        guard let checkUrl = URL(string: url) else {
+    func sendGroqRequest(_ request: GroqChatRequest) async {
+        // Replace with your actual Groq API token
+        let apiToken = "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"
+
+        // Construct the URL for the Groq API endpoint
+        guard let url = URL(string: "https://api.groq.com/openai/v1/chat/completions") else {
             print("Invalid URL")
             return
         }
-        
-        var request = URLRequest(url: checkUrl)
-        request.httpMethod = "GET"
-        let apiToken = "b6b64f8ae672ececa322ed6579e564863cab674a"
-        request.setValue("Token \(apiToken)", forHTTPHeaderField: "Authorization")
-        
-        var isCompleted = false
-        while !isCompleted {
-            try? await Task.sleep(nanoseconds: 500_000_000) // Sleep for 5 seconds
+
+        // Prepare the URLRequest object with the necessary HTTP headers
+        var urlRequest = URLRequest(url: url)
+        urlRequest.httpMethod = "POST"
+        urlRequest.addValue("Bearer \(apiToken)", forHTTPHeaderField: "Authorization")
+        urlRequest.addValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        do {
+            // Configure JSONEncoder to improve readability of the JSON string during debugging
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .prettyPrinted // Makes the JSON output pretty-printed
             
-            do {
-                let (data, response) = try await URLSession.shared.data(for: request)
-                guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-                    print("Error: Invalid response from server")
-                    print("Response: \(response)")
-                    return
-                }
+            // Encode the GroqChatRequest object into JSON data
+            let jsonData = try encoder.encode(request)
             
-                guard let jsonResponse = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any], 
-                    let status = jsonResponse["status"] as? String else {
-                    print("Error: Invalid JSON response")
-                    return
+            // Set the encoded JSON data as the body of the request
+            urlRequest.httpBody = jsonData
+
+            // Perform the network request asynchronously
+            let (data, response) = try await URLSession.shared.data(for: urlRequest)
+
+            // Check for a successful HTTP response
+            guard let httpResponse = response as? HTTPURLResponse else {
+                print("No HTTP response received.")
+                return
+            }
+
+            // Process the response data if the status code indicates success
+            if httpResponse.statusCode == 200 {
+                // Decode the JSON response into the GroqChatResponse object
+                let decoder = JSONDecoder()
+                let groqResponse = try decoder.decode(GroqChatResponse.self, from: data)
+                DispatchQueue.main.async {
+                    // Update the UI or state with the response summary
+                    self.apiResponseSummary = groqResponse.choices.first?.message.content ?? "No content received"
                 }
-                
-                if status == "succeeded" {
-                    isCompleted = true
-                } else if let output = jsonResponse["output"] as? [String] {
-                    // Join the output array into a singel string
-                    print("Output: \(output), status: \(status)")
-                    let summary = output.joined(separator: "").trimmingCharacters(in: .whitespacesAndNewlines)
-                    
-                    DispatchQueue.main.async {
-                        //Handel the summary text, eg., display it in the UI
-                        //Assuming 'currentText' is the State variable to display the summary
-                        //CurrentText = summary
-                        self.apiResponseSummary = summary
-                    }
-                }
-                                                                        
-            } catch {
-                    print("Error: \(error.localizedDescription)")
+            } else {
+                // Log error message or body for non-200 responses
+                print("Error: Non-200 status code received")
+                if let responseBody = String(data: data, encoding: .utf8) {
+                    print("Response Body: \(responseBody)")
                 }
             }
+        } catch {
+            // Log any errors that occurred during the request preparation or execution
+            print("Request error: \(error.localizedDescription)")
         }
-        
+    }
+
     
     func fetchModels() {
         availableModels = [selectedModel]
