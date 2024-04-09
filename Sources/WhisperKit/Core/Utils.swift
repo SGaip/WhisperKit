@@ -5,6 +5,7 @@ import AVFoundation
 import CoreML
 import Foundation
 import Tokenizers
+import Hub
 #if canImport(UIKit)
 import UIKit
 #elseif canImport(AppKit)
@@ -39,6 +40,22 @@ extension MLMultiArray {
     }
 }
 
+extension MLModel {
+    func asyncPrediction(
+        from input: MLFeatureProvider,
+        options: MLPredictionOptions
+    ) async throws -> MLFeatureProvider {
+        if #available(macOS 14, iOS 17, watchOS 10, visionOS 1, *) {
+            return try await prediction(from: input, options: options)
+        } else {
+            return try await Task {
+                try prediction(from: input, options: options)
+            }.value
+        }
+    }
+}
+
+@available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
 func initMLMultiArray(shape: [NSNumber], dataType: MLMultiArrayDataType, initialValue: Any) -> MLMultiArray {
     let multiArray = try! MLMultiArray(shape: shape, dataType: dataType)
 
@@ -222,6 +239,17 @@ extension Process {
 }
 #endif
 
+@available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
+public extension WhisperKit {
+    static var isRunningOnSimulator: Bool {
+        #if targetEnvironment(simulator)
+        return true
+        #else
+        return false
+        #endif
+    }
+}
+
 public func resolveAbsolutePath(_ inputPath: String) -> String {
     let fileManager = FileManager.default
 
@@ -242,10 +270,14 @@ public func resolveAbsolutePath(_ inputPath: String) -> String {
     return inputPath
 }
 
-func loadTokenizer(for pretrained: ModelVariant) async throws -> Tokenizer {
-    // TODO: Cache tokenizer config to avoid repeated network requests
+func loadTokenizer(
+    for pretrained: ModelVariant,
+    tokenizerFolder: URL? = nil,
+    useBackgroundSession: Bool = false
+) async throws -> Tokenizer {
     let tokenizerName = tokenizerNameForVariant(pretrained)
-    return try await AutoTokenizer.from(pretrained: tokenizerName)
+    let hubApi = HubApi(downloadBase: tokenizerFolder, useBackgroundSession: useBackgroundSession)
+    return try await AutoTokenizer.from(pretrained: tokenizerName, hubApi: hubApi)
 }
 
 func formatTimestamp(_ timestamp: Float) -> String {

@@ -9,18 +9,18 @@ import Hub
 import TensorUtils
 import Tokenizers
 
+@available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
 public protocol Transcriber {
     func transcribe(audioPath: String, decodeOptions: DecodingOptions?, callback: TranscriptionCallback) async throws -> TranscriptionResult?
     func transcribe(audioArray: [Float], decodeOptions: DecodingOptions?, callback: TranscriptionCallback) async throws -> TranscriptionResult?
 }
 
-@available(macOS 14, iOS 17, watchOS 10, visionOS 1, *)
+@available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
 public class WhisperKit: Transcriber {
     /// Models
     public var modelVariant: ModelVariant = .tiny
     public var modelState: ModelState = .unloaded
     public var modelCompute: ModelComputeOptions
-    public var modelFolder: URL?
     public var tokenizer: Tokenizer?
 
     /// Protocols
@@ -46,10 +46,20 @@ public class WhisperKit: Transcriber {
     public var decoderInputs: DecodingInputs?
     public var currentTimings: TranscriptionTimings?
 
+    /// State
+    public let progress = Progress()
+    
+    /// Configuration
+    public var modelFolder: URL?
+    public var tokenizerFolder: URL?
+    private let useBackgroundDownloadSession: Bool
+
     public init(
         model: String? = nil,
+        downloadBase: URL? = nil,
         modelRepo: String? = nil,
         modelFolder: String? = nil,
+        tokenizerFolder: URL? = nil,
         computeOptions: ModelComputeOptions? = nil,
         audioProcessor: (any AudioProcessing)? = nil,
         featureExtractor: (any FeatureExtracting)? = nil,
@@ -61,7 +71,8 @@ public class WhisperKit: Transcriber {
         logLevel: Logging.LogLevel = .info,
         prewarm: Bool? = nil,
         load: Bool? = nil,
-        download: Bool = true
+        download: Bool = true,
+        useBackgroundDownloadSession: Bool = false
     ) async throws {
         self.modelCompute = computeOptions ?? ModelComputeOptions()
         self.audioProcessor = audioProcessor ?? AudioProcessor()
@@ -70,10 +81,18 @@ public class WhisperKit: Transcriber {
         self.textDecoder = textDecoder ?? TextDecoder()
         self.logitsFilters = logitsFilters ?? []
         self.segmentSeeker = segmentSeeker ?? SegmentSeeker()
+        self.tokenizerFolder = tokenizerFolder
+        self.useBackgroundDownloadSession = useBackgroundDownloadSession
         Logging.shared.logLevel = verbose ? logLevel : .none
         currentTimings = TranscriptionTimings()
 
-        try await setupModels(model: model, modelRepo: modelRepo, modelFolder: modelFolder, download: download)
+        try await setupModels(
+            model: model,
+            downloadBase: downloadBase,
+            modelRepo: modelRepo,
+            modelFolder: modelFolder,
+            download: download
+        )
 
         if let prewarm = prewarm, prewarm {
             Logging.info("Prewarming models...")
@@ -157,8 +176,14 @@ public class WhisperKit: Transcriber {
         return sortedModels
     }
 
-    public static func download(variant: String, downloadBase: URL? = nil, from repo: String = "argmaxinc/whisperkit-coreml", progressCallback: ((Progress) -> Void)? = nil) async throws -> URL? {
-        let hubApi = HubApi(downloadBase: downloadBase)
+    public static func download(
+        variant: String,
+        downloadBase: URL? = nil,
+        useBackgroundSession: Bool = false,
+        from repo: String = "argmaxinc/whisperkit-coreml",
+        progressCallback: ((Progress) -> Void)? = nil
+    ) async throws -> URL? {
+        let hubApi = HubApi(downloadBase: downloadBase, useBackgroundSession: useBackgroundSession)
         let repo = Hub.Repo(id: repo, type: .models)
         do {
             let modelFolder = try await hubApi.snapshot(from: repo, matching: ["*\(variant.description)/*"]) { progress in
@@ -178,7 +203,13 @@ public class WhisperKit: Transcriber {
     }
 
     /// Sets up the model folder either from a local path or by downloading from a repository.
-    public func setupModels(model: String?, modelRepo: String?, modelFolder: String?, download: Bool) async throws {
+    public func setupModels(
+        model: String?,
+        downloadBase: URL? = nil,
+        modelRepo: String?,
+        modelFolder: String?,
+        download: Bool
+    ) async throws {
         // Determine the model variant to use
         let modelVariant = model ?? WhisperKit.recommendedModels().default
 
@@ -188,7 +219,12 @@ public class WhisperKit: Transcriber {
         } else if download {
             let repo = modelRepo ?? "argmaxinc/whisperkit-coreml"
             do {
-                let hubModelFolder = try await Self.download(variant: modelVariant, from: repo)
+                let hubModelFolder = try await Self.download(
+                    variant: modelVariant,
+                    downloadBase: downloadBase,
+                    useBackgroundSession: useBackgroundDownloadSession,
+                    from: repo
+                )
                 self.modelFolder = hubModelFolder!
             } catch {
                 // Handle errors related to model downloading
@@ -204,7 +240,9 @@ public class WhisperKit: Transcriber {
         try await loadModels(prewarmMode: true)
     }
 
-    public func loadModels(prewarmMode: Bool = false) async throws {
+    public func loadModels(
+        prewarmMode: Bool = false
+    ) async throws {
         modelState = prewarmMode ? .prewarming : .loading
 
         let modelLoadStart = CFAbsoluteTimeGetCurrent()
@@ -279,7 +317,11 @@ public class WhisperKit: Transcriber {
         {
             modelVariant = detectVariant(logitsDim: logitsDim, encoderDim: encoderDim)
             Logging.debug("Loading tokenizer for \(modelVariant)")
-            tokenizer = try await loadTokenizer(for: modelVariant)
+            tokenizer = try await loadTokenizer(
+                for: modelVariant,
+                tokenizerFolder: tokenizerFolder,
+                useBackgroundSession: useBackgroundDownloadSession
+            )
             textDecoder.tokenizer = tokenizer
             Logging.debug("Loaded tokenizer")
         } else {
@@ -360,6 +402,7 @@ public class WhisperKit: Transcriber {
                            decodeOptions: DecodingOptions? = nil,
                            callback: TranscriptionCallback = nil) async throws -> TranscriptionResult?
     {
+        progress.completedUnitCount = 0
         if currentTimings == nil {
             currentTimings = TranscriptionTimings()
         }
@@ -412,7 +455,7 @@ public class WhisperKit: Transcriber {
         let prefillTime = CFAbsoluteTimeGetCurrent() - prefillStartTime
         timings.prefill = prefillTime
 
-        // Add intial prompt to history
+        // Add initial prompt to history
         let currentTokens = decoderInputs.initialPrompt
 
         // Setup masks based on prefill values
@@ -449,10 +492,15 @@ public class WhisperKit: Transcriber {
 
         let startDecodeLoopTime = CFAbsoluteTimeGetCurrent()
 
+        let totalSeekDuration = seekClips.reduce(0, { return $0 + ($1.end - $1.start) })
+        progress.totalUnitCount = Int64(totalSeekDuration)
+        defer { progress.completedUnitCount = progress.totalUnitCount }
         for (seekClipStart, seekClipEnd) in seekClips {
             // Loop through the current clip until we reach the end
             // Typically this will be the full audio file, unless seek points are explicitly provided
             var seek: Int = seekClipStart
+
+            let previousSeekProgress = progress.completedUnitCount
 
             let windowPadding = 16000 // prevent hallucinations at the end of the clip by stopping up to 1.0s early
             while seek < seekClipEnd - windowPadding {
@@ -577,6 +625,9 @@ public class WhisperKit: Transcriber {
 
                 // Reset cache and move on to the next window
                 resetDecoderInputs()
+
+                let clipProgress = min(seek, seekClipEnd) - seekClipStart
+                progress.completedUnitCount = previousSeekProgress + Int64(clipProgress)
             }
         }
 

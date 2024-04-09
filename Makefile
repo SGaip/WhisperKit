@@ -20,6 +20,9 @@ setup:
 	@echo "Checking for git-lfs..."
 	@which git-lfs > /dev/null || (echo "Installing git-lfs..." && brew install git-lfs)
 	@echo "git-lfs is installed."
+	@echo "Checking for trash..."
+	@which trash > /dev/null || (echo "Installing trash..." && brew install trash)
+	@echo "trash is installed."
 	@echo "Done 🚀"
 
 
@@ -76,7 +79,7 @@ build:
 
 build-cli:
 	@echo "Building WhisperKit CLI..."
-	@swift build -c release --product transcribe
+	@swift build -c release --product whisperkit-cli
 
 
 test:

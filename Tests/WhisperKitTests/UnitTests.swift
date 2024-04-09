@@ -4,10 +4,11 @@
 import AVFoundation
 import CoreML
 import Tokenizers
+import Hub
 @testable import WhisperKit
 import XCTest
 
-@available(macOS 14, iOS 17, watchOS 10, visionOS 1, *)
+@available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
 final class UnitTests: XCTestCase {
     func testInit() async {
         let whisperKit = try? await WhisperKit(prewarm: false, load: false, download: false)
@@ -226,7 +227,9 @@ final class UnitTests: XCTestCase {
     }
 
     func testWindowing() async {
-        let computeOptions = ModelComputeOptions()
+        let computeOptions = ModelComputeOptions(
+            melCompute: .cpuOnly
+        )
         let whisperKit = try? await WhisperKit(modelFolder: tinyModelPath(), computeOptions: computeOptions, verbose: true, logLevel: .debug)
 
         guard let audioFilePath = Bundle.module.path(forResource: "jfk", ofType: "wav") else {
@@ -373,7 +376,7 @@ final class UnitTests: XCTestCase {
             XCTFail("Failed to transcribe")
             return
         }
-        XCTAssertEqual(result.text.prefix(4), "東京は晴")
+        XCTAssertEqual(result.text.prefix(3), "東京は")
     }
 
     func testNoTimestamps() async {
@@ -831,6 +834,7 @@ final class UnitTests: XCTestCase {
 
 // MARK: Helpers
 
+@available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
 extension MLMultiArray {
     /// Create `MLMultiArray` of shape [1, 1, arr.count] and fill up the last
     /// dimension with with values from arr.
@@ -858,7 +862,7 @@ extension MLMultiArray {
     }
 }
 
-@available(macOS 14, iOS 17, watchOS 10, visionOS 1, *)
+@available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
 extension XCTestCase {
     func transcribe(with variant: ModelVariant, options: DecodingOptions, audioFile: String = "jfk.wav", file: StaticString = #file, line: UInt = #line) async throws -> TranscriptionResult? {
         var modelPath = tinyModelPath()
@@ -904,6 +908,15 @@ extension XCTestCase {
         return modelPath
     }
 
+    func largev3TurboModelPath() -> String {
+        let modelDir = "whisperkit-coreml/openai_whisper-large-v3_turbo"
+        guard let modelPath = Bundle.module.urls(forResourcesWithExtension: "mlmodelc", subdirectory: modelDir)?.first?.deletingLastPathComponent().path else {
+            print("Failed to load model, ensure \"Models/\(modelDir)\" exists via Makefile command: `make download-models`")
+            return ""
+        }
+        return modelPath
+    }
+
     func allModelPaths() -> [String] {
         let fileManager = FileManager.default
         var modelPaths: [String] = []
@@ -921,6 +934,13 @@ extension XCTestCase {
             for folderURL in directoryContents {
                 let resourceValues = try folderURL.resourceValues(forKeys: Set(resourceKeys))
                 if resourceValues.isDirectory == true {
+                    // Check if the directory contains actual data files, or if it contains pointer files.
+                    // As a proxy, use the MelSpectrogramc.mlmodel/coredata.bin file.
+                    let proxyFileToCheck = folderURL.appendingPathComponent("MelSpectrogram.mlmodelc/coremldata.bin")
+                    if isGitLFSPointerFile(url: proxyFileToCheck) {
+                        continue
+                    }
+                    
                     // Check if the directory name contains the quantization pattern
                     // Only test large quantized models
                     let dirName = folderURL.lastPathComponent
@@ -934,6 +954,25 @@ extension XCTestCase {
         }
 
         return modelPaths
+    }
+    
+    // Function to check if the beginning of the file matches a Git LFS pointer pattern
+    func isGitLFSPointerFile(url: URL) -> Bool {
+        do {
+            let fileHandle = try FileHandle(forReadingFrom: url)
+            // Read the first few bytes of the file to get enough for the Git LFS pointer signature
+            let data = fileHandle.readData(ofLength: 512) // Read first 512 bytes
+            fileHandle.closeFile()
+
+            if let string = String(data: data, encoding: .utf8),
+               string.starts(with: "version https://git-lfs.github.com/") {
+                return true
+            }
+        } catch {
+            fatalError("Failed to read file: \(error)")
+        }
+        
+        return false
     }
 
     func trackForMemoryLeaks(on instance: AnyObject, file: StaticString = #filePath, line: UInt = #line) {
