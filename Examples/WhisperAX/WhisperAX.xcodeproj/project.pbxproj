@@ -51,13 +51,10 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-<<<<<<< HEAD
 		161135DE2B3F66DA003C20F6 /* WhisperAX Watch App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "WhisperAX Watch App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		161135F02B3F66DC003C20F6 /* WhisperAX Watch AppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "WhisperAX Watch AppTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		161135FA2B3F66DC003C20F6 /* WhisperAX Watch AppUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "WhisperAX Watch AppUITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		1626683A2BB90CC9008F950A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
-=======
->>>>>>> my-local-changes
 		1677AFA62B57618A008C61C0 /* WhisperAX_Watch_AppUITests.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = WhisperAX_Watch_AppUITests.swift; sourceTree = "<group>"; };
 		1677AFA72B57618A008C61C0 /* WhisperAX_Watch_AppUITestsLaunchTests.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = WhisperAX_Watch_AppUITestsLaunchTests.swift; sourceTree = "<group>"; };
 		1677AFA92B57618A008C61C0 /* WhisperAX.entitlements */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.entitlements; path = WhisperAX.entitlements; sourceTree = "<group>"; };
@@ -553,13 +550,12 @@
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-<<<<<<< HEAD
+
 				MARKETING_VERSION = 0.2.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.argmax.whisperkit.WhisperAX;
-=======
-				MARKETING_VERSION = 0.1.2;
-				PRODUCT_BUNDLE_IDENTIFIER = WhisperAX;
->>>>>>> my-local-changes
+				"PRODUCT_BUNDLE_IDENTIFIER[sdk=iphoneos*]" = WhisperAX2.0;
+				"PRODUCT_BUNDLE_IDENTIFIER[sdk=macosx*]" = WhisperAX2.0;
+
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = auto;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
@@ -603,13 +599,13 @@
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-<<<<<<< HEAD
+
+
 				MARKETING_VERSION = 0.2.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.argmax.whisperkit.WhisperAX;
-=======
-				MARKETING_VERSION = 0.1.2;
-				PRODUCT_BUNDLE_IDENTIFIER = WhisperAX;
->>>>>>> my-local-changes
+				"PRODUCT_BUNDLE_IDENTIFIER[sdk=iphoneos*]" = WhisperAX2.0;
+				"PRODUCT_BUNDLE_IDENTIFIER[sdk=macosx*]" = WhisperAX2.0;
+
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = auto;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
