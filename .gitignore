@@ -62,4 +62,4 @@ fastlane/test_output
 !*.xcodeproj/project.pbxproj
 !*.xcodeproj/xcshareddata/
 !*.xcworkspace/contents.xcworkspacedata
-/*.gcno
+/*.gcnoExamples/WhisperAX 2024-03-02 18-16-04/

@@ -9,12 +9,40 @@ import UIKit
 import AppKit
 #endif
 import AVFoundation
+import Foundation
+
+// Place your model definitions here
+struct ChatMessage: Codable {
+    let role: String
+    let content: String
+}
+
+struct GroqChatRequest: Codable {
+    let model: String
+    let messages: [ChatMessage]
+}
+
+struct Choice: Codable {
+    let index: Int
+    let message: ChatMessage
+    let finishReason: String?
+    let logprobs: [Double]?
+}
+
+struct GroqChatResponse: Codable {
+    let id: String
+    let object: String
+    let created: Int
+    let model: String
+    let choices: [Choice]
+    // Include other properties that the API might return
+}
 
 struct ContentView: View {
     @State var whisperKit: WhisperKit? = nil
-    #if os(macOS)
+#if os(macOS)
     @State var audioDevices: [AudioDevice]? = nil
-    #endif
+#endif
     @State var isRecording: Bool = false
     @State var isTranscribing: Bool = false
     @State var currentText: String = ""
@@ -22,7 +50,11 @@ struct ContentView: View {
     @State var modelStorage: String = "huggingface/models/argmaxinc/whisperkit-coreml"
 
     // MARK: Model management
-
+    @State var prompt: String = """
+    I'm having a job interview, below is the transcript of interview so far.
+    Please help me generate answers of questions.
+    """
+    @State private var apiResponseSummary: String = ""
     @State private var modelState: ModelState = .unloaded
     @State private var localModels: [String] = []
     @State private var localModelPath: String = ""
@@ -127,7 +159,6 @@ struct ContentView: View {
         bufferSeconds = 0
         confirmedSegments = []
         unconfirmedSegments = []
-
         eagerResults = []
         prevResult = nil
         lastAgreedSeconds = 0.0
@@ -137,6 +168,7 @@ struct ContentView: View {
         confirmedText = ""
         hypothesisWords = []
         hypothesisText = ""
+        apiResponseSummary = ""
     }
 
     var body: some View {
@@ -144,6 +176,13 @@ struct ContentView: View {
             modelSelectorView
                 .padding()
             Spacer()
+            
+            TextEditor(text: $prompt)
+            .frame(minHeight: 100)
+            .border(Color.gray, width: 1)
+            .padding()
+            Spacer()
+            
             List(menu, selection: $selectedCategoryId) { item in
                 HStack {
                     Image(systemName: item.image)
@@ -154,7 +193,7 @@ struct ContentView: View {
             }
             .disabled(modelState != .loaded)
             .foregroundColor(modelState != .loaded ? .secondary : .primary)
-            .navigationTitle("WhisperAX")
+            .navigationTitle("Chat Co-pilot")
             .navigationSplitViewColumnWidth(min: 300, ideal: 350)
         } detail: {
             VStack {
@@ -169,6 +208,12 @@ struct ContentView: View {
                 .padding()
                 #endif
                 controlsView
+                Button("Get Suggestion") {
+                    Task {
+                        await getSuggestion()
+                    }
+                }
+                .padding()
             }
             .toolbar(content: {
                 ToolbarItem {
@@ -265,6 +310,13 @@ struct ContentView: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
+                }
+                if !apiResponseSummary.isEmpty {
+                    Text(apiResponseSummary)
+                        .font(.headline)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             .frame(maxWidth: .infinity)
@@ -810,6 +862,87 @@ struct ContentView: View {
 
     // MARK: - Logic
 
+    func getSuggestion() async {
+        let fullTranscript = formatSegments(confirmedSegments + unconfirmedSegments, withTimestamps: enableTimestamps).joined(separator: "\n")
+
+        // System instruction as a separate message
+        let systemMessage = ChatMessage(role: "system", content: self.prompt)
+        
+        // User transcript as a separate message
+        let userMessage = ChatMessage(role: "user", content: fullTranscript)
+
+        // Constructing the messages array with system and user messages as separate entries
+        let messages = [systemMessage, userMessage]
+
+        // Constructing the request with required and optional parameters
+        let groqRequest = GroqChatRequest(
+            model: "mixtral-8x7b-32768",
+            messages: messages
+        )
+
+        await sendGroqRequest(groqRequest)
+    }
+
+    
+    func sendGroqRequest(_ request: GroqChatRequest) async {
+        // Replace with your actual Groq API token
+        let apiToken = "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"
+
+        // Construct the URL for the Groq API endpoint
+        guard let url = URL(string: "https://api.groq.com/openai/v1/chat/completions") else {
+            print("Invalid URL")
+            return
+        }
+
+        // Prepare the URLRequest object with the necessary HTTP headers
+        var urlRequest = URLRequest(url: url)
+        urlRequest.httpMethod = "POST"
+        urlRequest.addValue("Bearer \(apiToken)", forHTTPHeaderField: "Authorization")
+        urlRequest.addValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        do {
+            // Configure JSONEncoder to improve readability of the JSON string during debugging
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .prettyPrinted // Makes the JSON output pretty-printed
+            
+            // Encode the GroqChatRequest object into JSON data
+            let jsonData = try encoder.encode(request)
+            
+            // Set the encoded JSON data as the body of the request
+            urlRequest.httpBody = jsonData
+
+            // Perform the network request asynchronously
+            let (data, response) = try await URLSession.shared.data(for: urlRequest)
+
+            // Check for a successful HTTP response
+            guard let httpResponse = response as? HTTPURLResponse else {
+                print("No HTTP response received.")
+                return
+            }
+
+            // Process the response data if the status code indicates success
+            if httpResponse.statusCode == 200 {
+                // Decode the JSON response into the GroqChatResponse object
+                let decoder = JSONDecoder()
+                let groqResponse = try decoder.decode(GroqChatResponse.self, from: data)
+                DispatchQueue.main.async {
+                    // Update the UI or state with the response summary
+                    self.apiResponseSummary = groqResponse.choices.first?.message.content ?? "No content received"
+                }
+            } else {
+                // Log error message or body for non-200 responses
+                print("Error: Non-200 status code received")
+                if let responseBody = String(data: data, encoding: .utf8) {
+                    print("Response Body: \(responseBody)")
+                }
+            }
+        } catch {
+            // Log any errors that occurred during the request preparation or execution
+            print("Request error: \(error.localizedDescription)")
+        }
+    }
+
+    
     func fetchModels() {
         availableModels = [selectedModel]
 
