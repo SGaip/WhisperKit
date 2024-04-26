@@ -5,6 +5,7 @@ import AVFoundation
 import CoreML
 import Tokenizers
 import Hub
+import NaturalLanguage
 @testable import WhisperKit
 import XCTest
 
@@ -34,10 +35,10 @@ final class UnitTests: XCTestCase {
             Bundle.module.path(forResource: "jfk", ofType: "wav"),
             "Audio file not found"
         )
-        let audioBuffer = AudioProcessor.loadAudio(fromPath: audioFilePath)
+        let audioBuffer = try AudioProcessor.loadAudio(fromPath: audioFilePath)
         XCTAssertNotNil(audioBuffer, "Failed to load audio file at path: \(audioFilePath)")
-        XCTAssertEqual(audioBuffer!.format.sampleRate, 16000)
-        XCTAssertEqual(audioBuffer!.format.channelCount, 1)
+        XCTAssertEqual(audioBuffer.format.sampleRate, 16000)
+        XCTAssertEqual(audioBuffer.format.channelCount, 1)
     }
 
     func testAudioPad() {
@@ -169,20 +170,16 @@ final class UnitTests: XCTestCase {
         )
 
         let encoderInput = try MLMultiArray(shape: [1, 384, 1, 1500], dataType: .float16)
-        let inputs = try XCTUnwrap(
-            textDecoder.prepareDecoderInputs(withPrompt: [textDecoder.tokenizer!.specialTokens.startOfTranscriptToken]),
-            "Failed to prepare decoder inputs"
-        )
-        let expectedShape = 1
+        let inputs = try textDecoder.prepareDecoderInputs(withPrompt: [textDecoder.tokenizer!.specialTokens.startOfTranscriptToken])
 
-        let decoderOutput = try await textDecoder.decodeText(
-            from: encoderInput,
-            using: inputs,
-            sampler: tokenSampler,
-            options: decodingOptions
+        await XCTAssertNoThrowAsync(
+            try await textDecoder.decodeText(
+                from: encoderInput,
+                using: inputs,
+                sampler: tokenSampler,
+                options: decodingOptions
+            )
         )
-        XCTAssertNotNil(decoderOutput, "Failed to decode text")
-        XCTAssertEqual(decoderOutput.count, expectedShape, "Decoder output shape is not as expected")
     }
     
     func testDecoderLogProbThresholdDecodingFallback() async throws {
@@ -201,12 +198,10 @@ final class UnitTests: XCTestCase {
         let tokenSampler = GreedyTokenSampler(temperature: 0, eotToken: textDecoder.tokenizer!.specialTokens.endToken, decodingOptions: decodingOptions)
 
         let encoderInput = initMLMultiArray(shape: [1, 384, 1, 1500], dataType: .float16, initialValue: FloatType(0))
-        let decoderInputs = textDecoder.prepareDecoderInputs(withPrompt: [textDecoder.tokenizer!.specialTokens.startOfTranscriptToken])
-
-        let inputs = try XCTUnwrap(decoderInputs, "Failed to prepare decoder inputs")
+        let inputs = try textDecoder.prepareDecoderInputs(withPrompt: [textDecoder.tokenizer!.specialTokens.startOfTranscriptToken])
         let decoderOutput = try await textDecoder.decodeText(from: encoderInput, using: inputs, sampler: tokenSampler, options: decodingOptions)
 
-        let fallback = try XCTUnwrap(decoderOutput.first?.fallback, "Fallback should not be `nil`")
+        let fallback = try XCTUnwrap(decoderOutput.fallback, "Fallback should not be `nil`")
         XCTAssertEqual(fallback.fallbackReason, "logProbThreshold")
         XCTAssertTrue(fallback.needsFallback)
     }
@@ -227,12 +222,10 @@ final class UnitTests: XCTestCase {
         let tokenSampler = GreedyTokenSampler(temperature: 0, eotToken: textDecoder.tokenizer!.specialTokens.endToken, decodingOptions: decodingOptions)
 
         let encoderInput = initMLMultiArray(shape: [1, 384, 1, 1500], dataType: .float16, initialValue: FloatType(0))
-        let decoderInputs = textDecoder.prepareDecoderInputs(withPrompt: [textDecoder.tokenizer!.specialTokens.startOfTranscriptToken])
-
-        let inputs = try XCTUnwrap(decoderInputs, "Failed to prepare decoder inputs")
+        let inputs = try textDecoder.prepareDecoderInputs(withPrompt: [textDecoder.tokenizer!.specialTokens.startOfTranscriptToken])
         let decoderOutput = try await textDecoder.decodeText(from: encoderInput, using: inputs, sampler: tokenSampler, options: decodingOptions)
 
-        let fallback = try XCTUnwrap(decoderOutput.first?.fallback, "Fallback should not be `nil`")
+        let fallback = try XCTUnwrap(decoderOutput.fallback, "Fallback should not be `nil`")
         XCTAssertEqual(fallback.fallbackReason, "firstTokenLogProbThreshold")
         XCTAssertTrue(fallback.needsFallback)
     }
@@ -368,19 +361,15 @@ final class UnitTests: XCTestCase {
             Bundle.module.path(forResource: "jfk", ofType: "wav"),
             "Audio file not found"
         )
-        let audioBuffer = try XCTUnwrap(
-            AudioProcessor.loadAudio(fromPath: audioFilePath),
-            "Failed to load audio buffer"
-        )
-
+        let audioBuffer = try AudioProcessor.loadAudio(fromPath: audioFilePath)
         let audioSamples = AudioProcessor.convertBufferToArray(buffer: audioBuffer)
         let silence = [Float](repeating: 0.0, count: 30 * 16000)
         let multiWindowSamples = audioSamples + silence + audioSamples
 
         let options = DecodingOptions(usePrefillPrompt: true, withoutTimestamps: false, firstTokenLogProbThreshold: nil)
 
-        let transcribeResult = try await whisperKit.transcribe(audioArray: multiWindowSamples, decodeOptions: options)
-        let result = try XCTUnwrap(transcribeResult)
+        let transcribeResult: [TranscriptionResult] = try await whisperKit.transcribe(audioArray: multiWindowSamples, decodeOptions: options)
+        let result = try XCTUnwrap(transcribeResult.first)
         XCTAssertEqual(result.segments.count, 2, "Expected 3 segments")
 
         // Compare last timestamp to the length of the audio
@@ -489,30 +478,62 @@ final class UnitTests: XCTestCase {
 
         XCTAssertEqual(result.text.split(separator: " ").prefix(4).joined(separator: " "), "Esta es una grabación")
     }
-    
-    func testDetectSpanish() async{
+
+    func testDetectSpanish() async throws {
         let targetLanguage = "es"
-        let prefillLanguage = "en"
-        let optionsNoPrefill = DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, usePrefillPrompt: false)
+        let whisperKit = try await WhisperKit(
+            modelFolder: tinyModelPath(),
+            verbose: true,
+            logLevel: .debug
+        )
 
-        guard let resultNoPrefill = try? await transcribe(with: .tiny, options: optionsNoPrefill, audioFile: "es_test_clip.wav") else {
-            XCTFail("Failed to transcribe")
-            return
-        }
+        let audioFilePath = try XCTUnwrap(
+            Bundle.module.path(forResource: "es_test_clip", ofType: "wav"),
+            "Audio file not found"
+        )
 
-        XCTAssertEqual(resultNoPrefill.language, targetLanguage)
-        
-        let optionsPrefill = DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, usePrefillPrompt: true)
+        // To detect language only, set `sampleLength` to 1 and no prefill prompt
+        let optionsDetectOnly = DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, sampleLength: 1, detectLanguage: true)
+        let resultNoPrefill: [TranscriptionResult] = try await whisperKit.transcribe(audioPath: audioFilePath, decodeOptions: optionsDetectOnly)
 
-        guard let resultPrefill = try? await transcribe(with: .tiny, options: optionsPrefill, audioFile: "es_test_clip.wav") else {
-            XCTFail("Failed to transcribe")
-            return
-        }
-
-        XCTAssertEqual(resultPrefill.language, prefillLanguage)
+        XCTAssertEqual(resultNoPrefill.first?.language, targetLanguage)
     }
 
-    func testTranslateJapanese() async throws {
+    func testDetectSpanishOptions() async throws {
+        let optionsPairs: [(options: DecodingOptions, language: String)] = [
+            (DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, usePrefillPrompt: true, detectLanguage: true), "es"), // recommended usage for transcribing unknown language
+            (DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, usePrefillPrompt: true, detectLanguage: true, promptTokens: [0]), "es"), // ensure prompt doesnt interfere
+            (DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, usePrefillPrompt: true, detectLanguage: false), "en"), // en is the default prompt language
+            (DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, usePrefillPrompt: true, detectLanguage: nil), "en"), // en is the default prompt language
+            (DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, usePrefillPrompt: false, detectLanguage: true), "es"), // Unecessary combination, but can be useful if used with low `sampleLength` values to purely detect language and not decode (see above)
+            (DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, usePrefillPrompt: false, detectLanguage: false), "es"), // no prefill, model will detect language naturally
+            (DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, usePrefillPrompt: false, detectLanguage: nil), "es"), // no prefill, model will detect language naturally
+        ]
+
+        for (i, option) in optionsPairs.enumerated() {
+            let result = try await XCTUnwrapAsync(
+                await transcribe(with: .tiny, options: option.options, audioFile: "es_test_clip.wav"),
+                "Failed to transcribe"
+            )
+
+            let recognizer = NLLanguageRecognizer()
+            recognizer.processString(result.text)
+            let languageCode = recognizer.dominantLanguage!.rawValue
+
+            XCTAssertEqual(
+                languageCode,
+                option.language,
+                "Text language \"\(languageCode)\" at index \(i) did not match expected language \"\(option.language)\""
+            )
+            XCTAssertEqual(
+                result.first?.language,
+                option.language,
+                "Result language \"\(String(describing: result.first?.language))\" at index \(i) did not match expected language \"\(option.language)\""
+            )
+        }
+    }
+
+    func testTranslateJapaneseOptions() async throws {
         let targetLanguage = "ja"
         let options = DecodingOptions(task: .translate, language: targetLanguage, temperatureFallbackCount: 0)
 
@@ -535,27 +556,58 @@ final class UnitTests: XCTestCase {
 
         XCTAssertEqual(result.text.prefix(3), "東京は")
     }
-    
-    func testDetectJapanese() async{
+
+    func testDetectJapanese() async throws {
         let targetLanguage = "ja"
-        let prefillLanguage = "en"
-        let optionsNoPrefill = DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, usePrefillPrompt: false)
+        let whisperKit = try await WhisperKit(
+            modelFolder: tinyModelPath(),
+            verbose: true,
+            logLevel: .debug
+        )
 
-        guard let resultNoPrefill = try? await transcribe(with: .tiny, options: optionsNoPrefill, audioFile: "ja_test_clip.wav") else {
-            XCTFail("Failed to transcribe")
-            return
+        let audioFilePath = try XCTUnwrap(
+            Bundle.module.path(forResource: "ja_test_clip", ofType: "wav"),
+            "Audio file not found"
+        )
+
+        // To detect language only, set `sampleLength` to 1 and no prefill prompt
+        let optionsDetectOnly = DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, sampleLength: 1, detectLanguage: true)
+        let result: [TranscriptionResult] = try await whisperKit.transcribe(audioPath: audioFilePath, decodeOptions: optionsDetectOnly)
+
+        XCTAssertEqual(result.first?.language, targetLanguage)
+    }
+
+    func testDetectJapaneseOptions() async throws {
+        let optionsPairs: [(options: DecodingOptions, language: String)] = [
+            (DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, usePrefillPrompt: true, detectLanguage: true), "ja"), // recommended usage for transcribing unknown language
+            (DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, usePrefillPrompt: true, detectLanguage: false), "en"), // en is the default prompt language
+            (DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, usePrefillPrompt: true, detectLanguage: nil), "en"), // en is the default prompt language
+            (DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, usePrefillPrompt: false, detectLanguage: true), "ja"), // Unecessary combination, but can be useful if used with low `sampleLength` values to purely detect language and not decode (see above)
+            (DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, usePrefillPrompt: false, detectLanguage: false), "ja"), // no prefill, model will detect language naturally
+            (DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, usePrefillPrompt: false, detectLanguage: nil), "ja"), // no prefill, model will detect language naturally
+        ]
+
+        for (i, option) in optionsPairs.enumerated() {
+            let result = try await XCTUnwrapAsync(
+                await transcribe(with: .tiny, options: option.options, audioFile: "ja_test_clip.wav"),
+                "Failed to transcribe"
+            )
+
+            let recognizer = NLLanguageRecognizer()
+            recognizer.processString(result.text)
+            let languageCode = recognizer.dominantLanguage!.rawValue
+
+            XCTAssertEqual(
+                languageCode, 
+                option.language,
+                "Text language \"\(languageCode)\" at index \(i) did not match expected language \"\(option.language)\""
+            )
+            XCTAssertEqual(
+                result.first?.language,
+                option.language,
+                "Result language \"\(String(describing: result.first?.language))\" at index \(i) did not match expected language \"\(option.language)\""
+            )
         }
-
-        XCTAssertEqual(resultNoPrefill.language, targetLanguage)
-        
-        let optionsPrefill = DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, usePrefillPrompt: true)
-
-        guard let resultPrefill = try? await transcribe(with: .tiny, options: optionsPrefill, audioFile: "ja_test_clip.wav") else {
-            XCTFail("Failed to transcribe")
-            return
-        }
-
-        XCTAssertEqual(resultPrefill.language, prefillLanguage)
     }
 
     func testNoTimestamps() async throws {
@@ -605,12 +657,11 @@ final class UnitTests: XCTestCase {
         let audioSamples = [Float](repeating: 0.0, count: 30 * 16000)
         let options = DecodingOptions(usePrefillPrompt: false, skipSpecialTokens: false)
 
-        let result = try await XCTUnwrapAsync(
-            await whisperKit.transcribe(audioArray: audioSamples, decodeOptions: options),
-            "Failed to transcribe"
-        )
-        
-        XCTAssertTrue(result.segments.first!.tokens.contains(whisperKit.tokenizer!.specialTokens.noSpeechToken))
+        let result: [TranscriptionResult] = try await whisperKit.transcribe(audioArray: audioSamples, decodeOptions: options)
+        let tokenizer = try XCTUnwrap(whisperKit.tokenizer, "Tokeznier not available")
+        let segment = try XCTUnwrap(result.first?.segments.first, "First segment not available")
+
+        XCTAssertTrue(segment.tokens.contains(tokenizer.specialTokens.noSpeechToken))
     }
 
     func testTemperatureIncrement() async throws {
@@ -632,26 +683,24 @@ final class UnitTests: XCTestCase {
         )
 
         // Perform transcription
-        let result = try await XCTUnwrapAsync(
-            await whisperKit.transcribe(audioArray: audioSamples, decodeOptions: options),
-            "Failed to transcribe"
-        )
+        let result: [TranscriptionResult] = try await whisperKit.transcribe(audioArray: audioSamples, decodeOptions: options)
+        let segment = try XCTUnwrap(result.first?.segments.first, "First segment not available")
 
         let expectedTemperature = initialTemperature + temperatureIncrement * Float(fallbackCount)
-        XCTAssertEqual(result.segments.first!.temperature, expectedTemperature, "Temperature was not incremented correctly after fallbacks")
+        XCTAssertEqual(segment.temperature, expectedTemperature, "Temperature was not incremented correctly after fallbacks")
     }
 
     func testTopK() async throws {
         let result10000 = try await XCTUnwrapAsync(
-            await transcribe(with: .tiny, options: DecodingOptions(temperature: 0.5, topK: 10000)),
+            await transcribe(with: .tiny, options: DecodingOptions(temperature: 0.5, topK: 10000)).first,
             "Failed to transcribe"
         )
         let result5 = try await XCTUnwrapAsync(
-            await transcribe(with: .tiny, options: DecodingOptions(temperature: 0.5)),
+            await transcribe(with: .tiny, options: DecodingOptions(temperature: 0.5)).first,
             "Failed to transcribe"
         )
 
-        XCTAssertLessThan(Float(result5.timings!.decodingSampling), Float(result10000.timings!.decodingSampling), "topK=5 should be faster than topK=10000")
+        XCTAssertLessThan(Float(result5.timings.decodingSampling), Float(result10000.timings.decodingSampling), "topK=5 should be faster than topK=10000")
     }
 
     func testSeekClips() async throws {
@@ -681,7 +730,7 @@ final class UnitTests: XCTestCase {
     func testPromptTokens() async throws {
         let whisperKit = try await WhisperKit(modelFolder: tinyModelPath(), verbose: true, logLevel: .debug)
         let promptText = " prompt to encourage output without any punctuation and without capitalizing americans as if it was already normalized"
-        let tokenizer = whisperKit.tokenizer!
+        let tokenizer = try XCTUnwrap(whisperKit.tokenizer)
         let promptTokens = tokenizer.encode(text: promptText).filter { $0 < tokenizer.specialTokens.specialTokenBegin }
         let options = DecodingOptions(skipSpecialTokens: true, promptTokens: promptTokens)
 
@@ -697,7 +746,7 @@ final class UnitTests: XCTestCase {
         let whisperKit = try await WhisperKit(modelFolder: tinyModelPath(), verbose: true, logLevel: .debug)
         // Prefix to encourage output without any punctuation and without capitalizing americans as if it was already normalized
         let prefixText = " and so my fellow americans"
-        let tokenizer = whisperKit.tokenizer!
+        let tokenizer = try XCTUnwrap(whisperKit.tokenizer)
         let prefixTokens = tokenizer.encode(text: prefixText).filter { $0 < tokenizer.specialTokens.specialTokenBegin }
         let options = DecodingOptions(skipSpecialTokens: true, prefixTokens: prefixTokens)
 
@@ -728,6 +777,17 @@ final class UnitTests: XCTestCase {
         let logits4 = try MLMultiArray.logits([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
         logits4.fillLastDimension(indexes: 2..<5, with: -FloatType.infinity)
         XCTAssertEqual(logits4.data(for: 2), [0.1, 0.2, -.infinity, -.infinity, -.infinity, 0.6, 0.7])
+    }
+
+    func testChunkedArray() {
+        XCTAssertEqual([Int]().chunked(into: 1), [])
+        XCTAssertEqual([1, 2, 3, 4].chunked(into: 1), [[1], [2], [3], [4]])
+
+        XCTAssertEqual([Int]().chunked(into: 10), [])
+        XCTAssertEqual([1, 2, 3, 4].chunked(into: 10), [[1, 2, 3, 4]])
+
+        XCTAssertEqual([Int]().chunked(into: 3), [])
+        XCTAssertEqual([1, 2, 3, 4].chunked(into: 3), [[1, 2, 3], [4]])
     }
 
     // MARK: - LogitsFilter Tests
@@ -1030,16 +1090,16 @@ final class UnitTests: XCTestCase {
 
         let expectedWordTimings = [
             WordTiming(word: "<|0.00|>", tokens: [50364], start: 0, end: 1, probability: 1),
-            WordTiming(word: " Hello,", tokens: [2425, 11], start: 1, end: 3, probability: 1),
-            WordTiming(word: " world!", tokens: [1002, 0], start: 3, end: 5, probability: 1),
+            WordTiming(word: " Hello,", tokens: [2425, 11], start: 1, end: 2, probability: 1),
+            WordTiming(word: " world!", tokens: [1002, 0], start: 3, end: 4, probability: 1),
             WordTiming(word: "<|1.00|>", tokens: [50414], start: 5, end: 6, probability: 1),
             WordTiming(word: "<|1.00|>", tokens: [50414], start: 6, end: 7, probability: 1),
             WordTiming(word: " This", tokens: [639], start: 7, end: 8, probability: 1),
             WordTiming(word: " is", tokens: [307], start: 8, end: 9, probability: 1),
             WordTiming(word: " a", tokens: [257], start: 9, end: 10, probability: 1),
-            WordTiming(word: " test,", tokens: [220, 31636, 11], start: 10, end: 12, probability: 1),
+            WordTiming(word: " test,", tokens: [220, 31636, 11], start: 10, end: 11, probability: 1),
             WordTiming(word: " isn't", tokens: [1943, 380], start: 12, end: 13, probability: 1),
-            WordTiming(word: " it?", tokens: [309, 30], start: 13, end: 15, probability: 1),
+            WordTiming(word: " it?", tokens: [309, 30], start: 13, end: 14, probability: 1),
             WordTiming(word: "<|endoftext|>", tokens: [50257], start: 15, end: 16, probability: 1),
         ]
 
@@ -1060,7 +1120,8 @@ final class UnitTests: XCTestCase {
         // Spanish text: ¡Hola Mundo! Esta es una prueba, ¿no?
         let wordTimings = [
             WordTiming(word: "<|notimestamps|>", tokens: [50363], start: 0, end: 1, probability: 1),
-            WordTiming(word: "¡Hola", tokens: [24364, 48529], start: 1, end: 2, probability: 1),
+            WordTiming(word: " ¡", tokens: [24364], start: 0, end: 1, probability: 1),
+            WordTiming(word: "Hola", tokens: [48529], start: 1, end: 2, probability: 1),
             WordTiming(word: " Mundo", tokens: [376, 6043], start: 2, end: 3, probability: 1),
             WordTiming(word: "!", tokens: [0], start: 3, end: 4, probability: 1),
             WordTiming(word: " Esta", tokens: [20547], start: 4, end: 5, probability: 1),
@@ -1068,23 +1129,24 @@ final class UnitTests: XCTestCase {
             WordTiming(word: " una", tokens: [2002], start: 6, end: 7, probability: 1),
             WordTiming(word: " prueba", tokens: [48241], start: 7, end: 8, probability: 1),
             WordTiming(word: ",", tokens: [11], start: 8, end: 9, probability: 1),
-            WordTiming(word: " ¿no", tokens: [3841, 1771], start: 9, end: 10, probability: 1),
-            WordTiming(word: "?", tokens: [30], start: 10, end: 11, probability: 1),
-            WordTiming(word: "<|endoftext|>", tokens: [50257], start: 11, end: 12, probability: 1),
+            WordTiming(word: " ¿", tokens: [3841], start: 9, end: 10, probability: 1),
+            WordTiming(word: "no", tokens: [1771], start: 10, end: 11, probability: 1),
+            WordTiming(word: "?", tokens: [30], start: 11, end: 12, probability: 1),
+            WordTiming(word: "<|endoftext|>", tokens: [50257], start: 12, end: 13, probability: 1),
         ]
 
-        let mergedAlignmentTiming = SegmentSeeker().mergePunctuations(alignment: wordTimings, prepended: "\"'“¿([{-", appended: "\"'.。,，!！?？:：”)]}、")
+        let mergedAlignmentTiming = SegmentSeeker().mergePunctuations(alignment: wordTimings, prepended: "\"'“¡¿([{-", appended: "\"'.。,，!！?？:：”)]}、")
 
         let expectedWordTimings = [
             WordTiming(word: "<|notimestamps|>", tokens: [50363], start: 0, end: 1, probability: 1),
-            WordTiming(word: "¡Hola", tokens: [24364, 48529], start: 1, end: 2, probability: 1),
-            WordTiming(word: " Mundo!", tokens: [376, 6043, 0], start: 2, end: 4, probability: 1),
+            WordTiming(word: " ¡Hola", tokens: [24364, 48529], start: 1, end: 2, probability: 1),
+            WordTiming(word: " Mundo!", tokens: [376, 6043, 0], start: 2, end: 3, probability: 1),
             WordTiming(word: " Esta", tokens: [20547], start: 4, end: 5, probability: 1),
             WordTiming(word: " es", tokens: [785], start: 5, end: 6, probability: 1),
             WordTiming(word: " una", tokens: [2002], start: 6, end: 7, probability: 1),
-            WordTiming(word: " prueba,", tokens: [48241, 11], start: 7, end: 9, probability: 1),
-            WordTiming(word: " ¿no?", tokens: [3841, 1771, 30], start: 9, end: 11, probability: 1),
-            WordTiming(word: "<|endoftext|>", tokens: [50257], start: 11, end: 12, probability: 1),
+            WordTiming(word: " prueba,", tokens: [48241, 11], start: 7, end: 8, probability: 1),
+            WordTiming(word: " ¿no?", tokens: [3841, 1771, 30], start: 10, end: 11, probability: 1),
+            WordTiming(word: "<|endoftext|>", tokens: [50257], start: 12, end: 13, probability: 1),
         ]
 
         // First, assert the counts are as expected
@@ -1121,13 +1183,13 @@ final class UnitTests: XCTestCase {
 
         let expectedWordTimings = [
             WordTiming(word: "<|0.00|>", tokens: [50364], start: 0, end: 1, probability: 1),
-            WordTiming(word: "こんにちは、", tokens: [38088, 1231], start: 1, end: 3, probability: 1),
-            WordTiming(word: "世界！", tokens: [24486, 171, 120, 223], start: 3, end: 5, probability: 1),
+            WordTiming(word: "こんにちは、", tokens: [38088, 1231], start: 1, end: 2, probability: 1),
+            WordTiming(word: "世界！", tokens: [24486, 171, 120, 223], start: 3, end: 4, probability: 1),
             WordTiming(word: "これは", tokens: [25212], start: 5, end: 6, probability: 1),
             WordTiming(word: "テ", tokens: [22985], start: 6, end: 7, probability: 1),
             WordTiming(word: "スト", tokens: [40498], start: 7, end: 8, probability: 1),
             WordTiming(word: "です", tokens: [4767], start: 8, end: 9, probability: 1),
-            WordTiming(word: "よね？", tokens: [30346, 171, 120, 253], start: 9, end: 11, probability: 1),
+            WordTiming(word: "よね？", tokens: [30346, 171, 120, 253], start: 9, end: 10, probability: 1),
             WordTiming(word: "<|endoftext|>", tokens: [50257], start: 11, end: 12, probability: 1),
         ]
 
@@ -1207,10 +1269,7 @@ final class UnitTests: XCTestCase {
             XCTFail("Audio file not found")
             return
         }
-        guard let audioBuffer = AudioProcessor.loadAudio(fromPath: audioFileURL) else {
-            XCTFail("Failed to load audio buffer")
-            return
-        }
+        let audioBuffer = try AudioProcessor.loadAudio(fromPath: audioFileURL)
         let audioArray = AudioProcessor.convertBufferToArray(buffer: audioBuffer)
 
 
@@ -1233,7 +1292,7 @@ final class UnitTests: XCTestCase {
             let lastAgreedTokens = lastAgreedWords.flatMap { $0.tokens }
             streamOptions.prefixTokens = lastAgreedTokens
             do {
-                let result: TranscriptionResult? = try await whisperKit.transcribe(audioArray: simulatedStreamingAudio, decodeOptions: streamOptions)
+                let result: TranscriptionResult? = try await whisperKit.transcribe(audioArray: simulatedStreamingAudio, decodeOptions: streamOptions).first
                 var skipAppend = false
                 if let result = result {
                     hypothesisWords = result.allWords.filter { $0.start >= lastAgreedSeconds }

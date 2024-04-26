@@ -782,7 +782,7 @@ struct ContentView: View {
             VStack {
                 Text("Max Tokens Per Loop")
                 HStack {
-                    Slider(value: $sampleLength, in: 0...Double(min(whisperKit?.textDecoder.kvCacheMaxSequenceLength ?? WhisperKit.maxTokenContext, WhisperKit.maxTokenContext)), step: 10)
+                    Slider(value: $sampleLength, in: 0...Double(min(whisperKit?.textDecoder.kvCacheMaxSequenceLength ?? Constants.maxTokenContext, Constants.maxTokenContext)), step: 10)
                     Text(sampleLength.formatted(.number))
                         .frame(width: 30)
                     InfoButton("Maximum number of tokens to generate per loop.\nCan be lowered based on the type of speech in order to further prevent repetition loops from going too long.")
@@ -1069,7 +1069,7 @@ struct ContentView: View {
                         localModels.append(model)
                     }
                     
-                    availableLanguages = whisperKit.tokenizer?.languages.map { $0.key }.sorted() ?? ["english"]
+                    availableLanguages = Constants.languages.map { $0.key }.sorted()
                     loadingProgressValue = 1.0
                     modelState = whisperKit.modelState
                 }
@@ -1198,6 +1198,11 @@ struct ContentView: View {
                    let device = devices.first(where: {$0.name == selectedAudioInput}) {
                     deviceId = device.id
                 }
+
+                // There is no built-in microphone
+                if deviceId == nil {
+                   throw WhisperError.microphoneUnavailable()
+                }
                 #endif
 
                 try? audioProcessor.startRecordingLive(inputDeviceID: deviceId) { _ in
@@ -1239,10 +1244,7 @@ struct ContentView: View {
     // MARK: - Transcribe Logic
 
     func transcribeCurrentFile(path: String) async throws {
-        guard let audioFileBuffer = AudioProcessor.loadAudio(fromPath: path) else {
-            return
-        }
-
+        let audioFileBuffer = try AudioProcessor.loadAudio(fromPath: path)
         let audioFileSamples = AudioProcessor.convertBufferToArray(buffer: audioFileBuffer)
         let transcription = try await transcribeAudioSamples(audioFileSamples)
 
@@ -1253,12 +1255,12 @@ struct ContentView: View {
                 return
             }
 
-            self.tokensPerSecond = transcription?.timings?.tokensPerSecond ?? 0
-            self.effectiveRealTimeFactor = transcription?.timings?.realTimeFactor ?? 0
-            self.currentEncodingLoops = Int(transcription?.timings?.totalEncodingRuns ?? 0)
-            self.firstTokenTime = transcription?.timings?.firstTokenTime ?? 0
-            self.pipelineStart = transcription?.timings?.pipelineStart ?? 0
-            self.currentLag = transcription?.timings?.decodingLoop ?? 0
+            self.tokensPerSecond = transcription?.timings.tokensPerSecond ?? 0
+            self.effectiveRealTimeFactor = transcription?.timings.realTimeFactor ?? 0
+            self.currentEncodingLoops = Int(transcription?.timings.totalEncodingRuns ?? 0)
+            self.firstTokenTime = transcription?.timings.firstTokenTime ?? 0
+            self.pipelineStart = transcription?.timings.pipelineStart ?? 0
+            self.currentLag = transcription?.timings.decodingLoop ?? 0
 
             self.confirmedSegments = segments
         }
@@ -1267,7 +1269,7 @@ struct ContentView: View {
     func transcribeAudioSamples(_ samples: [Float]) async throws -> TranscriptionResult? {
         guard let whisperKit = whisperKit else { return nil }
 
-        let languageCode = whisperKit.tokenizer?.languages[selectedLanguage] ?? "en"
+        let languageCode = Constants.languages[selectedLanguage] ?? "en"
         let task: DecodingTask = selectedTask == "transcribe" ? .transcribe : .translate
         let seekClip = [lastConfirmedSegmentEndSeconds]
 
@@ -1313,12 +1315,14 @@ struct ContentView: View {
             if progress.avgLogprob! < options.logProbThreshold! {
                 return false
             }
-
             return nil
         }
 
-        let transcription = try await whisperKit.transcribe(audioArray: samples, decodeOptions: options, callback: decodingCallback)
-        return transcription
+        return try await whisperKit.transcribe(
+            audioArray: samples,
+            decodeOptions: options,
+            callback: decodingCallback
+        ).first
     }
 
     // MARK: Streaming Logic
@@ -1412,14 +1416,14 @@ struct ContentView: View {
             // Run realtime transcribe using word timestamps for segmentation
             let transcription = try await transcribeEagerMode(Array(currentBuffer))
             await MainActor.run {
-                self.tokensPerSecond = transcription?.timings?.tokensPerSecond ?? 0
-                self.firstTokenTime = transcription?.timings?.firstTokenTime ?? 0
-                self.pipelineStart = transcription?.timings?.pipelineStart ?? 0
-                self.currentLag = transcription?.timings?.decodingLoop ?? 0
-                self.currentEncodingLoops = Int(transcription?.timings?.totalEncodingRuns ?? 0)
+                self.tokensPerSecond = transcription?.timings.tokensPerSecond ?? 0
+                self.firstTokenTime = transcription?.timings.firstTokenTime ?? 0
+                self.pipelineStart = transcription?.timings.pipelineStart ?? 0
+                self.currentLag = transcription?.timings.decodingLoop ?? 0
+                self.currentEncodingLoops = Int(transcription?.timings.totalEncodingRuns ?? 0)
 
                 let totalAudio = Double(currentBuffer.count) / Double(WhisperKit.sampleRate)
-                self.totalInferenceTime = transcription?.timings?.fullPipeline ?? 0
+                self.totalInferenceTime = transcription?.timings.fullPipeline ?? 0
                 self.effectiveRealTimeFactor = Double(totalInferenceTime) / totalAudio
             }
         } else {
@@ -1434,14 +1438,14 @@ struct ContentView: View {
                     return
                 }
 
-                self.tokensPerSecond = transcription?.timings?.tokensPerSecond ?? 0
-                self.firstTokenTime = transcription?.timings?.firstTokenTime ?? 0
-                self.pipelineStart = transcription?.timings?.pipelineStart ?? 0
-                self.currentLag = transcription?.timings?.decodingLoop ?? 0
-                self.currentEncodingLoops += Int(transcription?.timings?.totalEncodingRuns ?? 0)
+                self.tokensPerSecond = transcription?.timings.tokensPerSecond ?? 0
+                self.firstTokenTime = transcription?.timings.firstTokenTime ?? 0
+                self.pipelineStart = transcription?.timings.pipelineStart ?? 0
+                self.currentLag = transcription?.timings.decodingLoop ?? 0
+                self.currentEncodingLoops += Int(transcription?.timings.totalEncodingRuns ?? 0)
 
                 let totalAudio = Double(currentBuffer.count) / Double(WhisperKit.sampleRate)
-                self.totalInferenceTime += transcription?.timings?.fullPipeline ?? 0
+                self.totalInferenceTime += transcription?.timings.fullPipeline ?? 0
                 self.effectiveRealTimeFactor = Double(totalInferenceTime) / totalAudio
 
                 // Logic for moving segments to confirmedSegments
@@ -1481,7 +1485,7 @@ struct ContentView: View {
             return nil
         }
 
-        let languageCode = whisperKit.tokenizer?.languages[selectedLanguage] ?? "en"
+        let languageCode = Constants.languages[selectedLanguage] ?? "en"
         let task: DecodingTask = selectedTask == "transcribe" ? .transcribe : .translate
 
         let options = DecodingOptions(
@@ -1539,7 +1543,7 @@ struct ContentView: View {
         let lastAgreedTokens = lastAgreedWords.flatMap { $0.tokens }
         streamOptions.prefixTokens = lastAgreedTokens
         do {
-            let transcription: TranscriptionResult? = try await whisperKit.transcribe(audioArray: streamingAudio, decodeOptions: streamOptions, callback: decodingCallback)
+            let transcription: TranscriptionResult? = try await whisperKit.transcribe(audioArray: streamingAudio, decodeOptions: streamOptions, callback: decodingCallback).first
             await MainActor.run {
                 var skipAppend = false
                 if let result = transcription {
