@@ -51,8 +51,7 @@ struct ContentView: View {
 
     // MARK: Model management
     @State var prompt: String = """
-    I'm having a job interview, below is the transcript of interview so far.
-    Please help me generate answers of questions.
+    I'm currently in a conversation. Below is the transcript of the conversation so far. Please help me generate effective responses to the questions or statements. Keep the responses concise, natural, and appropriate for the context of the conversation.
     """
     @State private var apiResponseSummary: String = ""
     @State private var modelState: ModelState = .unloaded
@@ -876,7 +875,7 @@ struct ContentView: View {
 
         // Constructing the request with required and optional parameters
         let groqRequest = GroqChatRequest(
-            model: "mixtral-8x7b-32768",
+            model: "Llama3-70b-8192",
             messages: messages
         )
 
