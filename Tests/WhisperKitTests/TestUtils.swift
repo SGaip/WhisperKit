@@ -1,3 +1,7 @@
+//  For licensing see accompanying LICENSE.md file.
+//  Copyright © 2024 Argmax, Inc. All rights reserved.
+
+import Combine
 import CoreML
 import Foundation
 @testable import WhisperKit
@@ -72,6 +76,33 @@ func XCTAssertNoThrowAsync(
 // MARK: Helpers
 
 @available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
+extension Bundle {
+    static var current: Bundle {
+        #if SWIFT_PACKAGE
+        return Bundle.module
+        #else
+        return Bundle.main
+        #endif
+    }
+}
+
+@available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
+extension FileManager {
+    func allocatedSizeOfDirectory(at url: URL) throws -> Int64 {
+        guard let enumerator = enumerator(at: url, includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey]) else {
+            throw NSError(domain: NSCocoaErrorDomain, code: NSFileReadUnknownError, userInfo: nil)
+        }
+
+        var accumulatedSize: Int64 = 0
+        for case let fileURL as URL in enumerator {
+            let resourceValues = try fileURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey])
+            accumulatedSize += Int64(resourceValues.totalFileAllocatedSize ?? resourceValues.fileAllocatedSize ?? 0)
+        }
+        return accumulatedSize
+    }
+}
+
+@available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
 extension MLMultiArray {
     /// Create `MLMultiArray` of shape [1, 1, arr.count] and fill up the last
     /// dimension with with values from arr.
@@ -104,6 +135,7 @@ extension XCTestCase {
     func transcribe(
         with variant: ModelVariant,
         options: DecodingOptions,
+        callback: TranscriptionCallback = nil,
         audioFile: String = "jfk.wav",
         file: StaticString = #file,
         line: UInt = #line
@@ -121,19 +153,20 @@ extension XCTestCase {
             textDecoderCompute: .cpuOnly,
             prefillCompute: .cpuOnly
         )
-        let whisperKit = try await WhisperKit(modelFolder: modelPath, computeOptions: computeOptions, verbose: true, logLevel: .debug)
+        let config = WhisperKitConfig(modelFolder: modelPath, computeOptions: computeOptions, verbose: true, logLevel: .debug)
+        let whisperKit = try await WhisperKit(config)
         trackForMemoryLeaks(on: whisperKit, file: file, line: line)
 
         let audioComponents = audioFile.components(separatedBy: ".")
-        guard let audioFileURL = Bundle.module.path(forResource: audioComponents.first, ofType: audioComponents.last) else {
+        guard let audioFileURL = Bundle.current.path(forResource: audioComponents.first, ofType: audioComponents.last) else {
             throw TestError.missingFile("Missing audio file")
         }
-        return try await whisperKit.transcribe(audioPath: audioFileURL, decodeOptions: options)
+        return try await whisperKit.transcribe(audioPath: audioFileURL, decodeOptions: options, callback: callback)
     }
 
     func tinyModelPath() throws -> String {
         let modelDir = "whisperkit-coreml/openai_whisper-tiny"
-        guard let modelPath = Bundle.module.urls(forResourcesWithExtension: "mlmodelc", subdirectory: modelDir)?.first?.deletingLastPathComponent().path else {
+        guard let modelPath = Bundle.current.urls(forResourcesWithExtension: "mlmodelc", subdirectory: modelDir)?.first?.deletingLastPathComponent().path else {
             throw TestError.missingFile("Failed to load model, ensure \"Models/\(modelDir)\" exists via Makefile command: `make download-models`")
         }
         return modelPath
@@ -141,7 +174,7 @@ extension XCTestCase {
 
     func largev3ModelPath() throws -> String {
         let modelDir = "whisperkit-coreml/openai_whisper-large-v3" // use faster to compile model for tests
-        guard let modelPath = Bundle.module.urls(forResourcesWithExtension: "mlmodelc", subdirectory: modelDir)?.first?.deletingLastPathComponent().path else {
+        guard let modelPath = Bundle.current.urls(forResourcesWithExtension: "mlmodelc", subdirectory: modelDir)?.first?.deletingLastPathComponent().path else {
             throw TestError.missingFile("Failed to load model, ensure \"Models/\(modelDir)\" exists via Makefile command: `make download-models`")
         }
         return modelPath
@@ -149,7 +182,7 @@ extension XCTestCase {
 
     func largev3TurboModelPath() throws -> String {
         let modelDir = "whisperkit-coreml/openai_whisper-large-v3_turbo"
-        guard let modelPath = Bundle.module.urls(forResourcesWithExtension: "mlmodelc", subdirectory: modelDir)?.first?.deletingLastPathComponent().path else {
+        guard let modelPath = Bundle.current.urls(forResourcesWithExtension: "mlmodelc", subdirectory: modelDir)?.first?.deletingLastPathComponent().path else {
             throw TestError.missingFile("Failed to load model, ensure \"Models/\(modelDir)\" exists via Makefile command: `make download-models`")
         }
         return modelPath
@@ -160,7 +193,7 @@ extension XCTestCase {
         var modelPaths: [String] = []
         let directory = "whisperkit-coreml"
         let resourceKeys: [URLResourceKey] = [.isDirectoryKey]
-        guard let baseurl = Bundle.module.resourceURL?.appendingPathComponent(directory) else {
+        guard let baseurl = Bundle.current.resourceURL?.appendingPathComponent(directory) else {
             throw TestError.missingDirectory("Base URL for directory \(directory) not found.")
         }
         let directoryContents = try fileManager.contentsOfDirectory(at: baseurl, includingPropertiesForKeys: resourceKeys, options: .skipsHiddenFiles)
@@ -173,7 +206,7 @@ extension XCTestCase {
                 if try isGitLFSPointerFile(url: proxyFileToCheck) {
                     continue
                 }
-                
+
                 // Check if the directory name contains the quantization pattern
                 // Only test large quantized models
                 let dirName = folderURL.lastPathComponent
@@ -184,15 +217,16 @@ extension XCTestCase {
         }
         return modelPaths
     }
-    
-    // Function to check if the beginning of the file matches a Git LFS pointer pattern
+
+    /// Function to check if the beginning of the file matches a Git LFS pointer pattern
     func isGitLFSPointerFile(url: URL) throws -> Bool {
         let fileHandle = try FileHandle(forReadingFrom: url)
         // Read the first few bytes of the file to get enough for the Git LFS pointer signature
         let data = fileHandle.readData(ofLength: 512) // Read first 512 bytes
         fileHandle.closeFile()
         if let string = String(data: data, encoding: .utf8),
-           string.starts(with: "version https://git-lfs.github.com/") {
+           string.starts(with: "version https://git-lfs.github.com/")
+        {
             return true
         }
         return false
@@ -238,19 +272,19 @@ extension SpecialTokens {
 extension Result {
     var isSuccess: Bool {
         switch self {
-        case .success:
-            return true
-        case .failure:
-            return false
+            case .success:
+                return true
+            case .failure:
+                return false
         }
     }
 
     func whisperError() -> WhisperError? {
         switch self {
-        case .success:
-            return nil
-        case .failure(let error):
-            return error as? WhisperError
+            case .success:
+                return nil
+            case let .failure(error):
+                return error as? WhisperError
         }
     }
 }
@@ -270,5 +304,13 @@ extension Collection where Element == TranscriptionResult {
 extension Collection where Element == TranscriptionResult {
     var segments: [TranscriptionSegment] {
         flatMap(\.segments)
+    }
+}
+
+public extension Publisher {
+    func withPrevious() -> AnyPublisher<(previous: Output?, current: Output), Failure> {
+        scan((Output?, Output)?.none) { ($0?.1, $1) }
+            .compactMap { $0 }
+            .eraseToAnyPublisher()
     }
 }

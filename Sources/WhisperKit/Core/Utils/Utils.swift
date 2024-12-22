@@ -5,20 +5,52 @@ import AVFoundation
 import CoreML
 import Foundation
 import Hub
-import Tokenizers
 import os.signpost
+import Tokenizers
 #if canImport(UIKit)
 import UIKit
 #elseif canImport(AppKit)
 import AppKit
 #endif
+#if canImport(Darwin)
+import Darwin
+#endif
 
 // MARK: - Extensions
 
 extension Array {
-    func chunked(into size: Int) -> [[Element]] {
+    func batched(into size: Int) -> [[Element]] {
         return stride(from: 0, to: count, by: size).map {
-            Array(self[$0 ..< Swift.min($0 + size, count)])
+            Array(self[$0..<Swift.min($0 + size, count)])
+        }
+    }
+}
+
+extension Array where Element == Result<[TranscriptionResult], Swift.Error> {
+    /// Convenience method to convert the `Result` object into an array of optional arrays of `TranscriptionResult`.
+    /// - Returns: An array of optional arrays containing `TranscriptionResult`.
+    func toOptionalArrays() -> [[TranscriptionResult]?] {
+        return self.map { try? $0.get() }
+    }
+}
+
+public extension Array where Element == TranscriptionSegment {
+    func contains(segment: TranscriptionSegment) -> Bool {
+        return self.contains { $0.start == segment.start }
+    }
+}
+
+extension Array where Element: Hashable {
+    /// Returns an array with duplicates removed, preserving the original order.
+    var orderedSet: [Element] {
+        var seen = Set<Element>()
+        return self.filter { element in
+            if seen.contains(element) {
+                return false
+            } else {
+                seen.insert(element)
+                return true
+            }
         }
     }
 }
@@ -56,7 +88,96 @@ extension MLMultiArray {
             pointer[linearOffset] = value
         }
     }
+
+    class func uninitializedIOSurfaceArray(shape: [NSNumber]) -> MLMultiArray? {
+        guard let width = shape.last?.intValue else { return nil }
+        let height = shape[0..<shape.count - 1].reduce(1) { $0 * $1.intValue }
+
+        var pixelBuffer: CVPixelBuffer?
+        let createReturn = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_OneComponent16Half,
+            [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary,
+            &pixelBuffer
+        )
+        guard createReturn == kCVReturnSuccess else { return nil }
+        guard let pixelBuffer = pixelBuffer else { return nil }
+
+        return MLMultiArray(pixelBuffer: pixelBuffer, shape: shape)
+    }
 }
+
+#if swift(>=5.10)
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, visionOS 2.0, *)
+public extension MLTensor {
+    func asIntArray() -> [Int] {
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: [Int] = []
+
+        Task(priority: .high) {
+            result = await self.shapedArray(of: Int32.self).scalars.map { Int($0) }
+            semaphore.signal()
+        }
+
+        semaphore.wait()
+        return result
+    }
+
+    func asFloatArray() -> [Float] {
+        let semaphore = DispatchSemaphore(value: 0)
+        let tensorType = self.scalarType
+
+        var result: [Float] = []
+
+        Task(priority: .high) {
+            switch tensorType {
+                case is Float32.Type:
+                    result = await self.shapedArray(of: Float32.self).scalars.map { Float($0) }
+                case is FloatType.Type:
+                    result = await self.shapedArray(of: FloatType.self).scalars.map { Float($0) }
+                case is Float.Type:
+                    result = await self.shapedArray(of: Float.self).scalars.map { Float($0) }
+                case is Int32.Type:
+                    result = await self.shapedArray(of: Int32.self).scalars.map { Float($0) }
+                default:
+                    fatalError("Unsupported data type")
+            }
+            semaphore.signal()
+        }
+
+        semaphore.wait()
+        return result
+    }
+
+    func asMLMultiArray() -> MLMultiArray {
+        let semaphore = DispatchSemaphore(value: 0)
+        let tensorType = self.scalarType
+
+        var result: MLMultiArray = initMLMultiArray(shape: [1], dataType: .float16, initialValue: 0.0)
+
+        Task(priority: .high) {
+            switch tensorType {
+                case is Float32.Type:
+                    result = MLMultiArray(await self.shapedArray(of: Float32.self))
+                case is FloatType.Type:
+                    result = MLMultiArray(await self.shapedArray(of: FloatType.self))
+                case is Float.Type:
+                    result = MLMultiArray(await self.shapedArray(of: Float.self))
+                case is Int32.Type:
+                    result = MLMultiArray(await self.shapedArray(of: Int32.self))
+                default:
+                    fatalError("Unsupported data type")
+            }
+            semaphore.signal()
+        }
+
+        semaphore.wait()
+        return result
+    }
+}
+#endif
 
 extension MLModel {
     func asyncPrediction(
@@ -73,46 +194,62 @@ extension MLModel {
     }
 }
 
-#if os(macOS)
+public extension MLComputeUnits {
+    var description: String {
+        switch self {
+            case .cpuOnly:
+                return "cpuOnly"
+            case .cpuAndGPU:
+                return "cpuAndGPU"
+            case .all:
+                return "all"
+            case .cpuAndNeuralEngine:
+                return "cpuAndNeuralEngine"
+            @unknown default:
+                return "unknown"
+        }
+    }
+}
+
+#if os(macOS) || targetEnvironment(simulator)
 // From: https://stackoverflow.com/a/71726663
-extension Process {
-    static func stringFromTerminal(command: String) -> String {
-        let task = Process()
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.launchPath = "/bin/bash"
-        task.arguments = ["-c", "sysctl -n " + command]
-        task.launch()
-        return String(bytes: pipe.fileHandleForReading.availableData, encoding: .utf8) ?? ""
+public extension ProcessInfo {
+    static func stringFromSysctl(named name: String) -> String {
+        var size: size_t = 0
+        sysctlbyname(name, nil, &size, nil, 0)
+        var machineModel = [CChar](repeating: 0, count: Int(size))
+        sysctlbyname(name, &machineModel, &size, nil, 0)
+        return String(cString: machineModel)
     }
 
-    static let processor = stringFromTerminal(command: "machdep.cpu.brand_string")
-    static let cores = stringFromTerminal(command: "machdep.cpu.core_count")
-    static let threads = stringFromTerminal(command: "machdep.cpu.thread_count")
-    static let vendor = stringFromTerminal(command: "machdep.cpu.vendor")
-    static let family = stringFromTerminal(command: "machdep.cpu.family")
+    static let processor = stringFromSysctl(named: "machdep.cpu.brand_string")
+    static let cores = stringFromSysctl(named: "machdep.cpu.core_count")
+    static let threads = stringFromSysctl(named: "machdep.cpu.thread_count")
+    static let vendor = stringFromSysctl(named: "machdep.cpu.vendor")
+    static let family = stringFromSysctl(named: "machdep.cpu.family")
+    static let hwModel = stringFromSysctl(named: "hw.model")
 }
 #endif
 
 @available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
 public extension WhisperKit {
     static var isRunningOnSimulator: Bool {
-#if targetEnvironment(simulator)
+        #if targetEnvironment(simulator)
         return true
-#else
+        #else
         return false
-#endif
+        #endif
     }
 }
 
-extension Float {
+public extension Float {
     func rounded(_ decimalPlaces: Int) -> Float {
         let divisor = pow(10.0, Float(decimalPlaces))
         return (self * divisor).rounded() / divisor
     }
 }
 
-extension String {
+public extension String {
     var normalized: String {
         // Trim whitespace and newlines
         let trimmedString = self.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -120,21 +257,135 @@ extension String {
         // Convert to lowercase
         let lowercaseString = trimmedString.lowercased()
 
+        // Replace dashes with spaces
+        let noDashesString = lowercaseString.replacingOccurrences(of: "-", with: " ")
+
         // Remove punctuation
-        let noPunctuationString = lowercaseString.components(separatedBy: .punctuationCharacters).joined()
+        let noPunctuationString = noDashesString.components(separatedBy: .punctuationCharacters).joined()
 
         // Replace multiple spaces with a single space
         let singleSpacedString = noPunctuationString.replacingOccurrences(of: " +", with: " ", options: .regularExpression)
 
         return singleSpacedString
     }
+
+    func trimmingSpecialTokenCharacters() -> String {
+        trimmingCharacters(in: Constants.specialTokenCharacters)
+    }
+}
+
+extension AVAudioPCMBuffer {
+    /// Converts the buffer to a float array
+    func asFloatArray() throws -> [Float] {
+        guard let data = floatChannelData?.pointee else {
+            throw WhisperError.audioProcessingFailed("Error converting audio, missing floatChannelData")
+        }
+        return Array(UnsafeBufferPointer(start: data, count: Int(frameLength)))
+    }
+
+    /// Appends the contents of another buffer to the current buffer
+    func appendContents(of buffer: AVAudioPCMBuffer) -> Bool {
+        return appendContents(of: buffer, startingFrame: 0, frameCount: buffer.frameLength)
+    }
+
+    /// Appends a specific range of frames from another buffer to the current buffer
+    func appendContents(of buffer: AVAudioPCMBuffer, startingFrame: AVAudioFramePosition, frameCount: AVAudioFrameCount) -> Bool {
+        guard format == buffer.format else {
+            Logging.debug("Format mismatch")
+            return false
+        }
+
+        guard startingFrame + AVAudioFramePosition(frameCount) <= AVAudioFramePosition(buffer.frameLength) else {
+            Logging.error("Insufficient audio in buffer")
+            return false
+        }
+
+        guard let destination = floatChannelData, let source = buffer.floatChannelData else {
+            Logging.error("Failed to access float channel data")
+            return false
+        }
+
+        var calculatedFrameCount = frameCount
+        if frameLength + frameCount > frameCapacity {
+            Logging.debug("Insufficient space in buffer, reducing frame count to fit")
+            calculatedFrameCount = frameCapacity - frameLength
+        }
+
+        let calculatedStride = stride
+        let destinationPointer = destination.pointee.advanced(by: calculatedStride * Int(frameLength))
+        let sourcePointer = source.pointee.advanced(by: calculatedStride * Int(startingFrame))
+
+        memcpy(destinationPointer, sourcePointer, Int(calculatedFrameCount) * calculatedStride * MemoryLayout<Float>.size)
+
+        frameLength += calculatedFrameCount
+        return true
+    }
+
+    /// Convenience initializer to concatenate multiple buffers into one
+    convenience init?(concatenating buffers: [AVAudioPCMBuffer]) {
+        guard !buffers.isEmpty else {
+            Logging.debug("Buffers array should not be empty")
+            return nil
+        }
+
+        let totalFrames = buffers.reduce(0) { $0 + $1.frameLength }
+
+        guard let firstBuffer = buffers.first else {
+            Logging.debug("Failed to get the first buffer")
+            return nil
+        }
+
+        self.init(pcmFormat: firstBuffer.format, frameCapacity: totalFrames)
+
+        for buffer in buffers {
+            if !appendContents(of: buffer) {
+                Logging.debug("Failed to append buffer")
+                return nil
+            }
+        }
+    }
+
+    /// Computed property to determine the stride for float channel data
+    private var stride: Int {
+        return Int(format.streamDescription.pointee.mBytesPerFrame) / MemoryLayout<Float>.size
+    }
 }
 
 // MARK: - Helpers
 
 @available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
+func prepareSeekClips(contentFrames: Int, decodeOptions: DecodingOptions?) -> [(start: Int, end: Int)] {
+    let options = decodeOptions ?? DecodingOptions()
+    var seekPoints: [Int] = options.clipTimestamps.map { Int(round($0 * Float(WhisperKit.sampleRate))) }
+    if seekPoints.count == 0 {
+        seekPoints.append(0)
+    }
+
+    if seekPoints.count % 2 == 1 {
+        seekPoints.append(contentFrames)
+    }
+
+    var seekClips: [(start: Int, end: Int)] = []
+    for i in stride(from: 0, to: seekPoints.count, by: 2) {
+        let start = seekPoints[i]
+        let end = i + 1 < seekPoints.count ? seekPoints[i + 1] : contentFrames
+        seekClips.append((start, end))
+    }
+
+    return seekClips
+}
+
+@available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
 func initMLMultiArray(shape: [NSNumber], dataType: MLMultiArrayDataType, initialValue: Any) -> MLMultiArray {
-    let multiArray = try! MLMultiArray(shape: shape, dataType: dataType)
+    var multiArray: MLMultiArray
+    switch dataType {
+        case .float16:
+            // IOSurface-backed arrays are implicitly float16. They can
+            // reduce buffer copies for some OS:compute unit combinations.
+            multiArray = MLMultiArray.uninitializedIOSurfaceArray(shape: shape)!
+        default:
+            multiArray = try! MLMultiArray(shape: shape, dataType: dataType)
+    }
 
     let count = multiArray.count
     let pointer = multiArray.dataPointer
@@ -263,68 +514,36 @@ func detectVariant(logitsDim: Int, encoderDim: Int) -> ModelVariant {
     return modelVariant
 }
 
-public func modelSupport(for deviceName: String) -> (default: String, disabled: [String]) {
-    switch deviceName {
-        case let model where model.hasPrefix("iPhone11"), // A12
-             let model where model.hasPrefix("iPhone12"), // A13
-             let model where model.hasPrefix("Watch7"): // Series 9 and Ultra 2
-            return ("openai_whisper-base", ["openai_whisper-small",
-                                            "openai_whisper-small.en",
-                                            "openai_whisper-large-v2",
-                                            "openai_whisper-large-v2_949MB",
-                                            "openai_whisper-large-v2_turbo",
-                                            "openai_whisper-large-v2_turbo_955MB",
-                                            "openai_whisper-large-v3",
-                                            "openai_whisper-large-v3_947MB",
-                                            "openai_whisper-large-v3_turbo",
-                                            "openai_whisper-large-v3_turbo_954MB",
-                                            "distil-whisper_distil-large-v3",
-                                            "distil-whisper_distil-large-v3_594MB",
-                                            "distil-whisper_distil-large-v3_turbo_600MB",
-                                            "distil-whisper_distil-large-v3_turbo"])
+@available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
+public func modelSupport(for deviceName: String, from config: ModelSupportConfig? = nil) -> ModelSupport {
+    let config = config ?? Constants.fallbackModelSupportConfig
+    let modelSupport = config.modelSupport(for: deviceName)
+    return modelSupport
+}
 
-        case let model where model.hasPrefix("iPhone13"): // A14
-            return ("openai_whisper-base", ["openai_whisper-large-v2",
-                                            "openai_whisper-large-v2_turbo",
-                                            "openai_whisper-large-v2_turbo_955MB",
-                                            "openai_whisper-large-v3",
-                                            "openai_whisper-large-v3_turbo",
-                                            "openai_whisper-large-v3_turbo_954MB",
-                                            "distil-whisper_distil-large-v3_turbo_600MB",
-                                            "distil-whisper_distil-large-v3_turbo"])
+/// Deprecated
+@available(*, deprecated, message: "Subject to removal in a future version. Use modelSupport(for:from:) -> ModelSupport instead.")
+@_disfavoredOverload
+@available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
+public func modelSupport(for deviceName: String, from config: ModelSupportConfig? = nil) -> (default: String, disabled: [String]) {
+    let modelSupport: ModelSupport = modelSupport(for: deviceName, from: config)
+    return (modelSupport.default, modelSupport.disabled)
+}
 
-        case let model where model.hasPrefix("iPhone14"), // A15
-             let model where model.hasPrefix("iPhone15"), // A16
-             let model where model.hasPrefix("iPhone16"): // A17
-            return ("openai_whisper-base", ["openai_whisper-large-v2",
-                                            "openai_whisper-large-v2_turbo",
-                                            "openai_whisper-large-v3",
-                                            "openai_whisper-large-v3_turbo"])
+public func detectModelURL(inFolder path: URL, named modelName: String) -> URL {
+    let compiledUrl = path.appending(path: "\(modelName).mlmodelc")
+    let packageUrl = path.appending(path: "\(modelName).mlpackage/Data/com.apple.CoreML/model.mlmodel")
 
-        // Fall through to macOS checks
-        default:
-            break
+    let compiledModelExists: Bool = FileManager.default.fileExists(atPath: compiledUrl.path)
+    let packageModelExists: Bool = FileManager.default.fileExists(atPath: packageUrl.path)
+
+    // Swap to mlpackage only if the following is true: we found the mlmodel within the mlpackage, and we did not find a .mlmodelc
+    var modelURL = compiledUrl
+    if packageModelExists && !compiledModelExists {
+        modelURL = packageUrl
     }
 
-    #if os(macOS)
-    if deviceName.hasPrefix("arm64") {
-        if Process.processor.contains("Apple M1") {
-            // Disable turbo variants for M1
-            return ("openai_whisper-base", ["openai_whisper-large-v2_turbo",
-                                            "openai_whisper-large-v2_turbo_955MB",
-                                            "openai_whisper-large-v3_turbo",
-                                            "openai_whisper-large-v3_turbo_954MB",
-                                            "distil-whisper_distil-large-v3_turbo_600MB",
-                                            "distil-whisper_distil-large-v3_turbo"])
-        } else {
-            // Enable all variants for M2 or M3, none disabled
-            return ("openai_whisper-base", [])
-        }
-    }
-    #endif
-
-    // Unhandled device, default to base variant
-    return ("openai_whisper-base", [""])
+    return modelURL
 }
 
 public func resolveAbsolutePath(_ inputPath: String) -> String {
@@ -347,13 +566,39 @@ public func resolveAbsolutePath(_ inputPath: String) -> String {
     return inputPath
 }
 
-func loadTokenizer(
+public func loadTokenizer(
     for pretrained: ModelVariant,
     tokenizerFolder: URL? = nil,
     useBackgroundSession: Bool = false
 ) async throws -> WhisperTokenizer {
     let tokenizerName = tokenizerNameForVariant(pretrained)
     let hubApi = HubApi(downloadBase: tokenizerFolder, useBackgroundSession: useBackgroundSession)
+
+    // Attempt to load tokenizer from local folder if specified
+    let resolvedTokenizerFolder = hubApi.localRepoLocation(HubApi.Repo(id: tokenizerName))
+    let tokenizerConfigPath = resolvedTokenizerFolder.appendingPathComponent("tokenizer.json")
+
+    // Check if 'tokenizer.json' exists in the folder
+    if FileManager.default.fileExists(atPath: tokenizerConfigPath.path) {
+        do {
+            let localConfig = LanguageModelConfigurationFromHub(modelFolder: resolvedTokenizerFolder, hubApi: hubApi)
+            if let tokenizerConfig = try await localConfig.tokenizerConfig {
+                let tokenizerData = try await localConfig.tokenizerData
+                let whisperTokenizer = try PreTrainedTokenizer(tokenizerConfig: tokenizerConfig, tokenizerData: tokenizerData)
+                Logging.debug("Loading tokenizer from local folder")
+                return WhisperTokenizerWrapper(tokenizer: whisperTokenizer)
+            } else {
+                // tokenizerConfig is nil, fall through to load from Hub
+                Logging.debug("Tokenizer configuration not found in local config")
+            }
+        } catch {
+            // Error during the local loading process and fall through to load from Hub
+            Logging.debug("Error loading local tokenizer: \(error)")
+        }
+    }
+
+    // Fallback to loading from the Hub if local loading is not possible or fails
+    Logging.debug("Loading tokenizer from Hub")
     return try await WhisperTokenizerWrapper(
         tokenizer: AutoTokenizer.from(
             pretrained: tokenizerName,
@@ -397,15 +642,53 @@ public func findLongestDifferentSuffix(_ words1: [WordTiming], _ words2: [WordTi
     return Array(remainingWords)
 }
 
-public func mergeTranscriptionResults(_ results: [TranscriptionResult?], confirmedWords: [WordTiming]) -> TranscriptionResult {
+@available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
+public func mergeTranscriptionResults(_ results: [TranscriptionResult?], confirmedWords: [WordTiming]? = nil) -> TranscriptionResult {
+    var mergedText = ""
+    if let words = confirmedWords {
+        mergedText = words.map { $0.word }.joined()
+    } else {
+        mergedText = results.map { $0?.text ?? "" }.joined(separator: " ")
+    }
+
+    // Merge segments
     let validResults = results.compactMap { $0 }
-    let language = validResults.first?.language ?? "en"
+    var mergedSegments = [TranscriptionSegment]()
+    var previousSeek: Float = 0.0
+    for (resultIndex, result) in validResults.enumerated() {
+        let seekTime = result.seekTime ?? previousSeek
+        for (segmentIndex, segment) in result.segments.enumerated() {
+            var updatedSegment = segment
+            updatedSegment.id = resultIndex + segmentIndex
+            mergedSegments.append(updatedSegment)
+        }
+        // Update previousSeek only if seekTime is nil
+        if result.seekTime == nil {
+            previousSeek += Float(result.timings.inputAudioSeconds)
+        } else {
+            previousSeek = seekTime + Float(result.timings.inputAudioSeconds)
+        }
+    }
 
-    let mergedSegments = validResults.flatMap { $0.segments }
-    let mergedText = confirmedWords.map { $0.word }.joined()
+    let language = validResults.first?.language ?? Constants.defaultLanguageCode
 
+    // Calculate the earliest start and latest end times
+    let earliestPipelineStart = validResults.map { $0.timings.pipelineStart }.min() ?? 0
+    let earliestTokenTime = validResults.map { $0.timings.firstTokenTime }.min() ?? 0
+    let latestPipelineEnd = validResults.map { $0.timings.pipelineStart + $0.timings.fullPipeline }.max() ?? 0
+
+    // Calculate the "user" pipeline time, excluding the time spent in concurrent pipelines
+    let userPipelineDuration = latestPipelineEnd - earliestPipelineStart
+    let systemPipelineDuration = validResults.map { $0.timings.fullPipeline }.reduce(0, +)
+    let fullPipelineDuration = min(userPipelineDuration, systemPipelineDuration)
+
+    // Update the merged timings with non-overlapping time values
     var mergedTimings = TranscriptionTimings(
         modelLoading: validResults.map { $0.timings.modelLoading }.max() ?? 0,
+        prewarmLoadTime: validResults.map { $0.timings.prewarmLoadTime }.max() ?? 0,
+        encoderLoadTime: validResults.map { $0.timings.encoderLoadTime }.max() ?? 0,
+        decoderLoadTime: validResults.map { $0.timings.decoderLoadTime }.max() ?? 0,
+        tokenizerLoadTime: validResults.map { $0.timings.tokenizerLoadTime }.max() ?? 0,
         audioLoading: validResults.map { $0.timings.audioLoading }.reduce(0, +),
         audioProcessing: validResults.map { $0.timings.audioProcessing }.reduce(0, +),
         logmels: validResults.map { $0.timings.logmels }.reduce(0, +),
@@ -429,17 +712,12 @@ public func mergeTranscriptionResults(_ results: [TranscriptionResult?], confirm
         totalTimestampAlignmentRuns: validResults.map { $0.timings.totalTimestampAlignmentRuns }.reduce(0, +),
         totalDecodingFallbacks: validResults.map { $0.timings.totalDecodingFallbacks }.reduce(0, +),
         totalDecodingWindows: validResults.map { $0.timings.totalDecodingWindows }.reduce(0, +),
-        fullPipeline: validResults.map { $0.timings.fullPipeline }.reduce(0, +)
+        fullPipeline: fullPipelineDuration
     )
 
+    mergedTimings.pipelineStart = earliestPipelineStart
+    mergedTimings.firstTokenTime = earliestTokenTime
     mergedTimings.inputAudioSeconds = validResults.map { $0.timings.inputAudioSeconds }.reduce(0, +)
-
-    // Average first token times
-    if let pipelineStart = validResults.first?.timings.pipelineStart {
-        let averageFirstTokenTime = validResults.map { (($0.timings.firstTokenTime) - ($0.timings.pipelineStart)) }.reduce(0, +) / Double(validResults.count)
-        mergedTimings.pipelineStart = pipelineStart
-        mergedTimings.firstTokenTime = pipelineStart + averageFirstTokenTime
-    }
 
     return TranscriptionResult(
         text: mergedText,
@@ -447,6 +725,23 @@ public func mergeTranscriptionResults(_ results: [TranscriptionResult?], confirm
         language: language,
         timings: mergedTimings
     )
+}
+
+@available(macOS 13, iOS 16, watchOS 10, visionOS 1, *)
+public func updateSegmentTimings(segment: TranscriptionSegment, seekTime: Float) -> TranscriptionSegment {
+    var updatedSegment = segment
+    let seekOffsetIndex = Int(seekTime * Float(WhisperKit.sampleRate))
+    updatedSegment.seek += seekOffsetIndex
+    updatedSegment.start += seekTime
+    updatedSegment.end += seekTime
+    if var words = updatedSegment.words {
+        for wordIndex in 0..<words.count {
+            words[wordIndex].start += seekTime
+            words[wordIndex].end += seekTime
+        }
+        updatedSegment.words = words
+    }
+    return updatedSegment
 }
 
 func timeit(operation: () -> Void) -> TimeInterval {
@@ -513,15 +808,40 @@ public func compressionRatio(of text: String) -> Float {
     }
 }
 
+public func logCurrentMemoryUsage(_ message: String) {
+    let memoryUsage = getMemoryUsage()
+    Logging.debug("\(message) - Memory usage: \(memoryUsage) MB")
+}
+
+public func getMemoryUsage() -> UInt64 {
+    var info = mach_task_basic_info()
+    var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
+
+    let kerr: kern_return_t = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
+            task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+        }
+    }
+
+    guard kerr == KERN_SUCCESS else {
+        return 0 // If the call fails, return 0
+    }
+
+    return info.resident_size / 1024 / 1024 // Convert to MB
+}
+
 // MARK: - Singletons
 
-public class Logging {
-    static let shared = Logging()
-    var logLevel: LogLevel = .none
+open class Logging {
+    public static let shared = Logging()
+    public var logLevel: LogLevel = .none
 
     public typealias LoggingCallback = (_ message: String) -> Void
-    var loggingCallback: LoggingCallback?
+    public var loggingCallback: LoggingCallback?
 
+    private let logger = OSLog(subsystem: Bundle.main.bundleIdentifier ?? "com.argmax.whisperkit", category: "WhisperKit")
+
+    @frozen
     public enum LogLevel: Int {
         case debug = 1
         case info = 2
@@ -535,30 +855,30 @@ public class Logging {
 
     private init() {}
 
-    public func log(_ items: Any..., separator: String = " ", terminator: String = "\n") {
+    public func log(_ items: Any..., separator: String = " ", terminator: String = "\n", type: OSLogType) {
         let message = items.map { "\($0)" }.joined(separator: separator)
         if let logger = loggingCallback {
             logger(message)
         } else {
-            print("[WhisperKit] \(message)", terminator: terminator)
+            os_log("%{public}@", log: logger, type: type, message)
         }
     }
 
     public static func debug(_ items: Any..., separator: String = " ", terminator: String = "\n") {
         if shared.logLevel.shouldLog(level: .debug) {
-            shared.log(items, separator: separator, terminator: terminator)
+            shared.log(items, separator: separator, terminator: terminator, type: .debug)
         }
     }
 
     public static func info(_ items: Any..., separator: String = " ", terminator: String = "\n") {
         if shared.logLevel.shouldLog(level: .info) {
-            shared.log(items, separator: separator, terminator: terminator)
+            shared.log(items, separator: separator, terminator: terminator, type: .info)
         }
     }
 
     public static func error(_ items: Any..., separator: String = " ", terminator: String = "\n") {
         if shared.logLevel.shouldLog(level: .error) {
-            shared.log(items, separator: separator, terminator: terminator)
+            shared.log(items, separator: separator, terminator: terminator, type: .error)
         }
     }
 }

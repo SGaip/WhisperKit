@@ -6,7 +6,7 @@ import ArgumentParser
 struct CLIArguments: ParsableArguments {
     @Option(help: "Paths to audio files")
     var audioPath = [String]()
-    
+
     @Option(help: "Path to a folder containing audio files")
     var audioFolder: String?
 
@@ -73,7 +73,10 @@ struct CLIArguments: ParsableArguments {
     @Option(help: "Condition on this text when decoding")
     var prompt: String?
 
-    @Argument(help: "Supress given tokens in the output")
+    @Option(parsing: .upToNextOption, help: "List of timestamps (in seconds) of start and end values to transcribe as seperate clips in single audio file (example: --clip-timestamps 0 10.2 34.5 60.0)")
+    var clipTimestamps: [Float] = []
+
+    @Option(parsing: .upToNextOption, help: "List of tokens to supress in the output (example: --supress-tokens 1 2 3)")
     var supressTokens: [Int] = []
 
     @Option(help: "Gzip compression ratio threshold for decoding failure")
@@ -100,6 +103,9 @@ struct CLIArguments: ParsableArguments {
     @Flag(help: "Simulate streaming transcription using the input audio file")
     var streamSimulated: Bool = false
 
-    @Option(help: "Maximum concurrent inference, might be helpful when processing more than 1 audio file at the same time. 0 means unlimited")
-    var concurrentWorkerCount: Int = 0
+    @Option(help: "Maximum concurrent inference, might be helpful when processing more than 1 audio file at the same time. 0 means unlimited. Default: 4")
+    var concurrentWorkerCount: Int = 4
+
+    @Option(help: "Chunking strategy for audio processing, `none` means no chunking, `vad` means using voice activity detection. Default: `vad`")
+    var chunkingStrategy: String = "vad"
 }
