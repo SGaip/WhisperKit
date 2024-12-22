@@ -875,7 +875,7 @@ struct ContentView: View {
 
         // Constructing the request with required and optional parameters
         let groqRequest = GroqChatRequest(
-            model: "Llama3-70b-8192",
+            model: "llama-3.3-70b-versatile",
             messages: messages
         )
 
